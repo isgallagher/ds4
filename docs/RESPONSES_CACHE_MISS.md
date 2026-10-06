@@ -72,11 +72,15 @@ So the miss is the **first *text* turn after a run of *tool-call* turns**, and `
 - **Alternative (pi-side, larger blast radius):** make pi replay the exact raw bytes ds4 generated instead of re-rendering. Correct in principle but touches pi, not ds4; the user wants it fixed in ds4.
 - **Do not** "just re-prefill and accept" — that is the current behavior and it's the cost.
 
+**Probe is built** (commit `c13f616`): an env-gated token-window dump at the miss site (`DS4_CACHE_MISS_DEBUG=1`). On every `live kv cache miss` it logs the first-diff index plus, for ±32 tokens around it, the live id, the prompt id, `match===/!=`, and the **base64** of each side's decoded token text (base64 so raw special-token bytes never hit the log stream). No behavior change unless the env var is set.
+
+**To run it:** restart the server with `DS4_CACHE_MISS_DEBUG=1` in its environment (operator-controlled; do not restart without the go), drive one miss (tool calls → final text turn), then `grep CACHEMISS_DEBUG <log>`. The `first_diff=` line and the `!=` rows name the divergent item exactly.
+
 **NOT yet done (do not assume it is):**
-- [ ] No live two-turn capture through the logging proxy for the *miss* pair (proxy script exists, `/tmp/fc-debug/proxy2.py`, but the captured `req-*.json` for the exact miss pair were not retained).
-- [ ] No debug log added at the mismatch site.
-- [ ] No fix built or tested.
-- [ ] No confirmation of the exact divergent token at 298741.
+- [x] Debug log at the mismatch site (built, `c13f616`).
+- [ ] Live miss captured through the probe (needs the restart + one victim turn).
+- [ ] Confirmation of the exact divergent token/item at the mismatch point.
+- [ ] The fix itself, built and tested.
 
 ---
 

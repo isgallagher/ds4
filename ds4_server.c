@@ -13631,7 +13631,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                     size_t lnb = 0;
                     char *lt = ds4_token_text(s->engine, lv, &lnb);
                     if (lt) {
-                        int n = server_b64_encode(lt, lnb, lb, sizeof(lb));
+                        int n = server_b64_encode((const unsigned char *)lt, lnb, lb, sizeof(lb));
                         (void)n;
                         free(lt);
                     }
@@ -13640,7 +13640,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                     size_t pnb = 0;
                     char *pt = ds4_token_text(s->engine, pv, &pnb);
                     if (pt) {
-                        int n = server_b64_encode(pt, pnb, pb, sizeof(pb));
+                        int n = server_b64_encode((const unsigned char *)pt, pnb, pb, sizeof(pb));
                         (void)n;
                         free(pt);
                     }

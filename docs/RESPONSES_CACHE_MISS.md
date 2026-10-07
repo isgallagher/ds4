@@ -1,7 +1,7 @@
 # ds4 `/v1/responses` — project intake & KV-cache-miss handoff
 
 > [!summary] Status in one line
-> Bug 1 (permanent 400) is **fixed and on the branch** `fix/responses-replay-status-tolerance` (commit `10e2a71`, unpushed, 1 ahead of `main`). Bug 2 (live KV-cache miss on every turn of a long pi session) is **the open bug** — mechanism is understood to high confidence, the exact divergent token is *not* yet captured, and the fix is *not* yet built. This doc is the handoff so a fresh session can continue without re-deriving it.
+> Bug 1 (permanent 400) is **fixed and on the branch** `fix/responses-replay-status-tolerance` (commit `10e2a71`). Bug 2 (live KV-cache miss on every turn of a long pi session) is **reproduced + probe-captured**: the mechanism is confirmed from the victim's own server log (a forked client history freezes `common` mid-history and the miss path re-prefills from token 0 every turn — see `RESPONSES_REPLAY_MISS_TEST.md`), and the fix is **specified but not yet built**. This doc is the handoff so a fresh session can continue without re-deriving it.
 
 **Read this top-to-bottom before touching `ds4_server.c`.**
 
@@ -78,9 +78,9 @@ So the miss is the **first *text* turn after a run of *tool-call* turns**, and `
 
 **NOT yet done (do not assume it is):**
 - [x] Debug log at the mismatch site (built, `c13f616`).
-- [ ] Live miss captured through the probe (needs the restart + one victim turn).
-- [ ] Confirmation of the exact divergent token/item at the mismatch point.
-- [ ] The fix itself, built and tested.
+- [x] Live miss captured through the probe — done 2026-10-06 (`force_http.py` fork repro; `server-capture.log` shows `reason=token-mismatch` + the ±32 window naming the fork). See `RESPONSES_REPLAY_MISS_TEST.md` § Calibration.
+- [x] Divergence confirmed: the client's re-rendered **history** forks from the live KV mid-history (a history rewrite/compaction, e.g. the victim's aborted-turn `status:incomplete` reasoning items + short re-sent histories). Not a mutable id, not a single field.
+- [ ] **The fix itself, built and tested** — two guarded parts in the Responses miss path (rebase the checkpoint at `common` on a token-mismatch miss + a forked disk-load guard). Full spec + verification plan: `Projects/ds4/progress.md` (vault) and `RESPONSES_REPLAY_MISS_TEST.md` § Fix consequence.
 
 ---
 

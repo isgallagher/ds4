@@ -26,28 +26,60 @@ common=298741` — prompt grew +21, common ended **5,634 tokens before** the liv
 end: the divergence is **mid-history**, in the era the tool fast path had been
 masking.
 
-**Leading hypothesis (post-disk-load desync — matches the owner's "re-render
-might be wrong" point, and the calibration run).** A fresh session never
-misses: the client's re-render of every prior turn stays bit-exact with the
-live KV, so the text turn hits (verified, both thinking levels). The victim
-differed in exactly one structural way, and it is where `common` lands: the
-session's live state was **rebuilt from a disk-snapshot load** (line 562,
-cr=192512), and `common=298741` is precisely the token frontier at the **end
-of that disk-load turn**. Before that boundary the client's re-render and the
-live KV agree; the divergence is in what the live KV holds **after** the
-load — the model's **raw sampled bytes** (think blocks, DSML tool-call text)
-that a later text turn re-renders *from the client's stored items*, and where
-the re-render no longer matches the sampled bytes. The tool turns between the
-load and the text turn never exposed it (fast path, no token compare).
+**PRIMARY-SOURCE mechanism (from the victim's own server log, supersedes the
+earlier "reasoning re-render drift" frame).** Four properties, all read from
+`/tmp/fc-debug/patched-server.log`:
 
-**Not yet confirmed — the probe settles it.** `DS4_CACHE_MISS_DEBUG=1`
-(commit `c13f616`) dumps the ±32-token window as base64 on every miss; the `!=`
-rows name the exact divergent field. Candidates, in the order the victim
-structure predicts: (1) a re-rendered **think/reasoning block** for a
-post-load turn (raw sampled bytes vs. the stored summary); (2) a re-rendered
-**DSML tool call** (raw bytes vs. re-serialized `function_call`); (3) a mutable
-field (id/timestamp). All three candidates sit *after* the 192512 prefix, so
-the window should start just past the load boundary.
+1. **The desync self-perpetuates.** From 13:10:35 onward `common` **froze at
+   247203** for the rest of the era (40+ min), while `live` grew to 297K;
+   every turn missed at that same frozen point, re-prefill gap growing
+   4459 → 50145. A one-time drift heals on the next turn (the client re-sends
+   the corrected history). A *frozen* `common` means the divergence is in
+   **stable, already-in-history tokens the client keeps re-sending that no
+   longer equal the live tokens** — it cannot heal on its own. The disk
+   fallbacks that served those turns used `key=responses-visible` snapshots
+   (13:10:39 `kv cache hit text tokens=250733 key=responses-visible`).
+
+2. **The trigger is a client that rewrites/shrinks its effective history.**
+   The era immediately before the freeze (12:31–13:10) is full of **tiny
+   prompts** (8–18K) against a ~245K live, `common=4690` — the client sent
+   *short* histories, not full re-sends (compaction / partial replay). The
+   client's history stops being a prefix extension of the slot's live and forks
+   from it. Once that lands, the continuation keeps re-prefilling the frozen
+   gap every turn instead of healing.
+
+3. **The `REUSE_RESPONSES_VISIBLE` tier is where the victim's healthy turns
+   lived, and where it first degraded.** The 13:07:41 turn was
+   `match=visible-prefix cached=247203` — the visible tier reuses the live
+   frontier on the strength of a byte-prefix match of the *visible* transcript
+   (no full token compare, so it was invisible to the compare). It started a
+   long think turn; the freeze began the next turn. The visible tier is the
+   fast path that masks drift on tool turns *and* the trust that a text turn
+   relies on before it falls to the full compare.
+
+4. **Aborted turns are in the replay.** Every frozen miss turn opens with
+   repeated `replayed reasoning item with non-terminal status incomplete;
+   accepting` — the client keeps re-sending reasoning items that never reached
+   `completed` (aborted turns). This is the round-trip Bug 1's patch now
+   tolerates (`status != completed` accepted, warning logged). The desync sits
+   in the era those items belong to.
+
+**This is why the controlled runs all HIT (calibration, not a pass):** none of
+fresh / thinking-max / disk-load+restart+text *shrinks* the client history
+mid-session, so the client and slot stay in lockstep and the text turn hits
+(the forced run's log proves it: `kv cache hit text tokens=71680` then
+`ctx=73930..73955:25` — only the new user message re-prefilled). Reproducing
+the miss therefore requires a history rewrite (compaction or a partial/visible
+replay), which `pi --print` in a fresh scratch session does not do. The token
+window of a *real* miss is still what the probe must capture; the owner
+confirmed the bug is general ("not only from that one victim session") and can
+trigger it.
+
+**Fix consequence:** the canonicalize-on-text-turn fix (rewrite-from-common to
+the client's canonical render, `ds4_session_rewrite_from_common` :13031) must
+not only make one turn hit — it must **heal the frozen desync** so the *next*
+turn's `common == live` and the re-prefill stops. A fix that only fixes the
+single request leaves the per-turn re-prefill.
 
 ## Test contract
 

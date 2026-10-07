@@ -175,6 +175,37 @@ tool call ≠ a mutable id/timestamp).
   `slot_probe_reuse_locked`, `build_live_prompt_suffix`,
   `responses_prepare_live_continuation`, or the checkpoint/rewrite paths.
 
+## Fix status (2026-10-06, `b93dd54`)
+
+Built and verified. The fix is the fork-heal block in the Responses miss
+path (`ds4_server.c` :13649+, commit `b93dd54`): on a token-mismatch miss with
+a mid-history fork (`0 < common < live`, `common < prompt`, text-only), it
+(1) skips the evict-store of the forked checkpoint, (2) rejects a disk payload
+whose loaded tokens fork from the client's canonical prompt
+(`responses disk checkpoint forks from client re-render` log line + discard),
+and (3) heals by full-syncing the client's canonical prompt so the checkpoint
+becomes the client's re-render.
+
+Verified on the capture server (`qwen3.8-flash-next-393k` @ 393k, probe on):
+- **Fresh in-lockstep harness: GREEN** — exit 0, tool turns HIT, text turn
+  `suffix=25` (calibration unchanged). Re-run after the fix: pass.
+- **Fork repro (small + at scale >4096 tokens, disk era):** fork turn misses
+  once + full heal prefill, next turns `HIT visible-prefix` in lockstep,
+  no frozen `common`, no forked evict-store. Scripts: `fork_think_scale.py`
+  (two-phase), `fork_disk_guard.py` (the guard's repro: era with thinking →
+  restart shutdown-store → forked disk load → guard fires, payload discarded,
+  next turn HIT).
+- **Guard line observed live** on the disk-era fork turn (`loaded=4794
+  common=4758` → discard + heal). That is the victim's exact re-load loop,
+  broken.
+
+Note on the test's own RED/GREEN contract: the fork-heal turn still logs a
+`live kv cache miss … reason=token-mismatch` (the fork is a genuine
+re-derivation; the fix makes it heal once instead of re-forcing every turn).
+So a RED-shape turn after the fix shows: one miss line on the fork turn +
+HIT on the continuation turns. A run that misses on **consecutive** turns at
+the same frozen `common` is the regression this fix removes.
+
 ## Guardrails (carried from the incident)
 
 - Never restart a live server without the owner's go. A capture server is a

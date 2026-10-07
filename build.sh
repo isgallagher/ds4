@@ -7,6 +7,10 @@
 # Nothing here touches the working tree or any branch. The build is
 # deterministic for a given (upstream main + patch pair): re-run it any time.
 #
+# RUNBOOK: docs/BUILD_PATCHES.md — the safety behaviors, how to update a
+# patch, what to do when upstream main moves, and how to swap the live
+# server. Read it before changing patches/ or this script.
+#
 # Patches (in ./patches/):
 #   0001-responses-accept-nonterminal-status.patch
 #       Responses replay: accept non-terminal item status, drop unknown
@@ -76,4 +80,4 @@ make -C "${WT}" -j"$(sysctl -n hw.ncpu)" CC=/usr/bin/clang ds4-server
 cp "${WT}/ds4-server" ./ds4-server
 chmod +x ./ds4-server
 echo "done: ./ds4-server built from upstream ${FRESH} + 2 patches"
-echo "run:  ./start-qwen38-longctx.sh"
+echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

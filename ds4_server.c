@@ -4694,8 +4694,6 @@ static bool parse_responses_content_array_multimodal(
     return true;
 }
 
-static void server_log(ds4_log_type type, const char *fmt, ...);
-
 /* Codex /v1/responses input items have a `type` discriminator (message,
  * function_call, function_call_output, reasoning, custom_tool_call,
  * custom_tool_call_output, ...). We collapse them into chat_msgs the same way
@@ -4915,21 +4913,32 @@ item_fail:
         (*p)++;
 
         const char *t = type ? type : "message";
-        /* Non-terminal replayed status (in_progress / incomplete / failed)
-         * used to fail the whole request. ds4 itself emits those items
-         * (responses_sse_reasoning_done for reasoning, the message close
-         * paths on length/error finish) and must round-trip its own
-         * output, and dropping the item would orphan its paired tool
-         * output. Accept and clear the status; the content still replays
-         * (matching the intent below). */
+        /* Replayed items must be in a terminal "completed" state. in_progress,
+         * incomplete, and failed all represent partial model state the client
+         * never confirmed — feeding them back as history would let DS4 continue
+         * from a tool action that never finished. Reject explicitly. */
         if (status_str && status_str[0] &&
             strcmp(status_str, "completed") != 0)
         {
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: replayed %s item with non-terminal status %s; accepting",
-                       type ? type : "message", status_str);
+            free(type);
+            free(role);
+            free(content);
+            free(name);
+            free(namespace);
+            free(call_id);
+            free(item_id);
+            free(arguments);
+            free(output);
+            free(input_str);
+            free(summary);
+            free(action);
+            free(result);
+            free(tools_json);
             free(status_str);
-            status_str = NULL;
+            server_image_inputs_free(&content_images);
+            server_image_inputs_free(&output_images);
+            buf_free(&pending_reasoning);
+            return false;
         }
         if ((content_images.len &&
              (strcmp(t, "message") || (role && strcmp(role, "user")))) ||
@@ -5135,15 +5144,30 @@ item_fail:
             }
             chat_msgs_push(msgs, msg);
         } else if (!is_bookkeeping) {
-            /* Unknown item type: drop this one item with a warning and keep
-             * the session alive. Failing the whole replay for a single schema
-             * drift item is worse than losing that item's context; the common
-             * free tail below releases every local. Only compaction /
-             * context_compaction pass through silently (is_bookkeeping). */
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: dropping unknown replayed item type %s id=%s",
-                       type ? type : "(none)",
-                       item_id ? item_id : "(none)");
+            /* Anything we don't have an explicit branch for would silently
+             * drop replay context. Fail the parse instead so the client sees
+             * the limitation rather than ending up with stale generation
+             * built on an incomplete history. Only compaction/context_compaction
+             * (true Codex bookkeeping) are allowed to pass through silently. */
+            free(type);
+            free(role);
+            free(content);
+            free(name);
+            free(namespace);
+            free(call_id);
+            free(item_id);
+            free(arguments);
+            free(output);
+            free(input_str);
+            free(summary);
+            free(action);
+            free(result);
+            free(tools_json);
+            free(status_str);
+            server_image_inputs_free(&content_images);
+            server_image_inputs_free(&output_images);
+            buf_free(&pending_reasoning);
+            return false;
         }
 
         free(type);
@@ -9831,39 +9855,6 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* Small local base64 encoder for diagnostic dumps. Bounds the output to
- * outsz (NUL included); returns the number of base64 chars written (excluding
- * the NUL). Used only by the env-gated cache-miss token window so that raw
- * special-token bytes from the tokenizer never reach the log stream. */
-static int server_b64_encode(const unsigned char *in, size_t in_len, char *out, size_t outsz) {
-    static const char tab[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    if (out == NULL || outsz == 0) return 0;
-    size_t o = 0;
-    size_t i = 0;
-    while (i + 3 <= in_len && o + 5 < outsz) {
-        out[o++] = tab[in[i] >> 2];
-        out[o++] = tab[((in[i] << 4) | (in[i + 1] >> 4)) & 0x3F];
-        out[o++] = tab[((in[i + 1] << 2) | (in[i + 2] >> 6)) & 0x3F];
-        out[o++] = tab[in[i + 2] & 0x3F];
-        i += 3;
-    }
-    int rem = (int)(in_len - i);
-    if (rem == 1 && o + 4 <= outsz) {
-        out[o++] = tab[in[i] >> 2];
-        out[o++] = tab[(in[i] & 0x03) << 4];
-        out[o++] = '=';
-        out[o++] = '=';
-    } else if (rem == 2 && o + 4 <= outsz) {
-        out[o++] = tab[in[i] >> 2];
-        out[o++] = tab[((in[i] & 0x03) << 4) | (in[i + 1] >> 4)];
-        out[o++] = tab[(in[i + 1] & 0x0F) << 2];
-        out[o++] = '=';
-    }
-    out[o] = '\0';
-    return (int)o;
-}
-
 static pthread_mutex_t server_log_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void server_log(ds4_log_type type, const char *fmt, ...) {
@@ -13603,53 +13594,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    old_pos, j->req.prompt.len, common,
                    live_vision_match ? "match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
-        /* Diagnostic (env-gated, DS4_CACHE_MISS_DEBUG=1): dump a token window
-         * around the first live/prompt divergence as base64 plus raw token ids,
-         * so the mismatch can be read without re-deriving it. The live KV is
-         * only observable from inside the server, so this is the offline-safe
-         * way to name the item at the divergence point. Base64 keeps any
-         * special-token bytes out of the log stream as raw tokens. */
-        if (getenv("DS4_CACHE_MISS_DEBUG") != NULL) {
-            const ds4_tokens *live_toks = ds4_session_tokens(slot->session);
-            const ds4_tokens *prompt_toks = &j->req.prompt;
-            const int live_len = live_toks ? live_toks->len : 0;
-            const int prompt_len = prompt_toks ? prompt_toks->len : 0;
-            const int w = 32;
-            int s0 = common - w;
-            if (s0 < 0) s0 = 0;
-            int e0 = common + w + 1;
-            if (e0 > live_len && e0 > prompt_len) e0 = (live_len > prompt_len ? live_len : prompt_len);
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: CACHEMISS_DEBUG first_diff=%d window=[%d..%d) live_len=%d prompt_len=%d",
-                       common, s0, e0, live_len, prompt_len);
-            for (int pos = s0; pos < e0; pos++) {
-                const int lv = (live_toks && pos < live_len) ? live_toks->v[pos] : -1;
-                const int pv = (prompt_toks && pos < prompt_len) ? prompt_toks->v[pos] : -1;
-                char lb[2048] = "<absent>";
-                char pb[2048] = "<absent>";
-                if (lv >= 0) {
-                    size_t lnb = 0;
-                    char *lt = ds4_token_text(s->engine, lv, &lnb);
-                    if (lt) {
-                        int n = server_b64_encode((const unsigned char *)lt, lnb, lb, sizeof(lb));
-                        (void)n;
-                        free(lt);
-                    }
-                }
-                if (pv >= 0) {
-                    size_t pnb = 0;
-                    char *pt = ds4_token_text(s->engine, pv, &pnb);
-                    if (pt) {
-                        int n = server_b64_encode((const unsigned char *)pt, pnb, pb, sizeof(pb));
-                        (void)n;
-                        free(pt);
-                    }
-                }
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: CACHEMISS_DEBUG pos=%d live=%d prompt=%d match=%s live64=%s prompt64=%s",
-                           pos, lv, pv, (lv == pv) ? "==" : "!=", lb, pb);
-            }
-        }
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
@@ -13657,20 +13601,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    /* Bug 2 (Responses fork heal): a token-mismatch miss with a nonempty
-     * shared prefix means the client's canonical re-render forked from the
-     * live checkpoint mid-history (a compaction/abort/edit rewrote the
-     * history). The forked live checkpoint, and any disk payload keyed to it,
-     * diverge from what the client will resend. Persisting or loading them
-     * re-seeds the fork on every turn: the next compare misses at the same
-     * frozen point and the fallback re-runs (the victim's frozen-common era).
-     * On that shape, skip the evict-store below, reject a forked disk payload,
-     * and heal by full-syncing the client's canonical prompt so the
-     * checkpoint becomes the client's re-render and the next turn continues
-     * in lockstep. */
+    /* Responses fork heal: a token-mismatch miss with a nonempty shared
+     * prefix means the client's canonical re-render forked from the live
+     * checkpoint mid-history (a compaction, abort, or history edit rewrote
+     * the transcript). The forked live checkpoint, and any disk payload
+     * keyed to it, diverge from what the client will resend. Persisting or
+     * loading them re-seeds the fork on every turn: the next compare misses
+     * at the same frozen point and the fallback re-runs. On that shape,
+     * skip the evict-store below, reject a forked disk payload, and heal by
+     * full-syncing the client's canonical prompt so the checkpoint becomes
+     * the client's re-render and the next turn continues in lockstep. */
     const bool responses_fork_heal =
         responses_protocol && !multimodal && old_pos > 0 &&
         common > 0 && common < old_pos && common < j->req.prompt.len;
+    if (cached == 0 && responses_fork_heal) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: responses live checkpoint forks from client re-render RESPPROTO live=%d prompt=%d common=%d; healing from canonical prompt (skip forked evict-store, reject forked disk load)",
+                   old_pos, j->req.prompt.len, common);
+    }
     if (!multimodal && s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens && !responses_fork_heal) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
@@ -13686,7 +13634,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
         if (disk_cached > 0) {
-            /* Forked disk-load guard (Bug 2): the payload was found by a text
+            /* Forked disk-load guard: the payload was found by a text
              * prefix, but its tokens are from the era it was saved. On a
              * Responses fork heal that era forks from the client's current
              * re-render (raw generated bytes, or a re-seeded forked

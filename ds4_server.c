@@ -11467,16 +11467,28 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
         int64_t start = (int64_t)req->images[i].token_start - wrapper;
         uint64_t end = (uint64_t)req->images[i].token_start +
                         req->images[i].embedding.token_count + wrapper;
-        if (!marker || start < 0 || end > (uint64_t)req->prompt.len) {
+        if (!marker || start < (wrapper ? 0 : 1) ||
+            end + (wrapper ? 0u : 1u) > (uint64_t)req->prompt.len) {
             ds4_tokens_free(&prompt);
             return false;
         }
         char *text = xstrndup(cursor, (size_t)(marker - cursor));
         ds4_tokenize_rendered_chat(s->engine, text, &prompt);
         free(text);
-        spans[i].token_start = (uint32_t)(prompt.len + wrapper);
-        for (int64_t p = start; p < (int64_t)end; p++)
-            ds4_tokens_push(&prompt, req->prompt.v[p]);
+        if (wrapper == 0) {
+            /* The span records the first pad, so the suffix must carry the
+             * full vision block (vision_start .. vision_end).  Copying only
+             * the pads desyncs the live KV from any full re-render of the
+             * same history at the block boundary. */
+            ds4_tokens_push(&prompt, req->prompt.v[start - 1]);
+            spans[i].token_start = (uint32_t)(prompt.len + wrapper);
+            for (int64_t p = start; p <= (int64_t)end; p++)
+                ds4_tokens_push(&prompt, req->prompt.v[p]);
+        } else {
+            spans[i].token_start = (uint32_t)(prompt.len + wrapper);
+            for (int64_t p = start; p < (int64_t)end; p++)
+                ds4_tokens_push(&prompt, req->prompt.v[p]);
+        }
         cursor = marker + strlen(req->image_markers[i]);
     }
     ds4_tokenize_rendered_chat(s->engine, cursor, &prompt);

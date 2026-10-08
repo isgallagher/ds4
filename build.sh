@@ -23,6 +23,11 @@
 #       Diagnostic (env-gated, DS4_CACHE_MISS_DEBUG=1): on a live KV cache
 #       miss, dump the first-diff index plus a ±32-token window (ids +
 #       base64 text) around it. No behavior change without the env var.
+#   0004-responses-vision-block-continuation.patch
+#       Copy the full vision block (vision_start..vision_end) into the
+#       live KV continuation suffix instead of only the pads; the
+#       truncated copy forked every full re-render that crosses an image
+#       tool result (tests/test_responses_image_read_repro.py).
 #
 # Upstream branch is `main` (origin/HEAD), not `master`.
 #
@@ -76,6 +81,7 @@ echo "applying patches ..."
 apply patches/0001-responses-accept-nonterminal-status.patch
 apply patches/0002-responses-heal-forked-checkpoint.patch
 apply patches/0003-responses-cache-miss-probe.patch
+apply patches/0004-responses-vision-block-continuation.patch
 
 # --- 3. Build in the worktree ---
 echo "building ds4-server ..."
@@ -84,5 +90,5 @@ make -C "${WT}" -j"$(sysctl -n hw.ncpu)" CC=/usr/bin/clang ds4-server
 # --- 4. Install the binary over ./ds4-server (run scripts exec ./ds4-server) ---
 cp "${WT}/ds4-server" ./ds4-server
 chmod +x ./ds4-server
-echo "done: ./ds4-server built from upstream ${FRESH} + 3 patches"
+echo "done: ./ds4-server built from upstream ${FRESH} + 4 patches"
 echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

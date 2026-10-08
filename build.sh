@@ -19,6 +19,10 @@
 #   0002-responses-heal-forked-checkpoint.patch
 #       Responses fork-heal in the miss path (PR antirez/ds4#1194,
 #       pr/responses-fork-heal).
+#   0003-responses-cache-miss-probe.patch
+#       Diagnostic (env-gated, DS4_CACHE_MISS_DEBUG=1): on a live KV cache
+#       miss, dump the first-diff index plus a ±32-token window (ids +
+#       base64 text) around it. No behavior change without the env var.
 #
 # Upstream branch is `main` (origin/HEAD), not `master`.
 #
@@ -71,6 +75,7 @@ apply() {
 echo "applying patches ..."
 apply patches/0001-responses-accept-nonterminal-status.patch
 apply patches/0002-responses-heal-forked-checkpoint.patch
+apply patches/0003-responses-cache-miss-probe.patch
 
 # --- 3. Build in the worktree ---
 echo "building ds4-server ..."
@@ -79,5 +84,5 @@ make -C "${WT}" -j"$(sysctl -n hw.ncpu)" CC=/usr/bin/clang ds4-server
 # --- 4. Install the binary over ./ds4-server (run scripts exec ./ds4-server) ---
 cp "${WT}/ds4-server" ./ds4-server
 chmod +x ./ds4-server
-echo "done: ./ds4-server built from upstream ${FRESH} + 2 patches"
+echo "done: ./ds4-server built from upstream ${FRESH} + 3 patches"
 echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

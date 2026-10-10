@@ -28,6 +28,14 @@
 #       live KV continuation suffix instead of only the pads; the
 #       truncated copy forked every full re-render that crosses an image
 #       tool result (tests/test_responses_image_read_repro.py).
+#   0005-qwen-visible-suffix-final-answer-reasoning.patch
+#       The Qwen Responses-visible suffix must carry the turn's reasoning
+#       whenever the client receives reasoning, not only on tool-call
+#       turns: pi replays the reasoning item for final answers too, and
+#       the next render places it in the think block.  Omitting it made
+#       the tier decline on final-answer turns, so any tokenization-drift
+#       fork in the KV surfaced as a full re-prefill.  Adds
+#       test_qwen_visible_suffix_carries_final_answer_reasoning.
 #
 # Upstream branch is `main` (origin/HEAD), not `master`.
 #
@@ -82,6 +90,7 @@ apply patches/0001-responses-accept-nonterminal-status.patch
 apply patches/0002-responses-heal-forked-checkpoint.patch
 apply patches/0003-responses-cache-miss-probe.patch
 apply patches/0004-responses-vision-block-continuation.patch
+apply patches/0005-qwen-visible-suffix-final-answer-reasoning.patch
 
 # --- 3. Build in the worktree ---
 echo "building ds4-server ..."
@@ -90,5 +99,5 @@ make -C "${WT}" -j"$(sysctl -n hw.ncpu)" CC=/usr/bin/clang ds4-server
 # --- 4. Install the binary over ./ds4-server (run scripts exec ./ds4-server) ---
 cp "${WT}/ds4-server" ./ds4-server
 chmod +x ./ds4-server
-echo "done: ./ds4-server built from upstream ${FRESH} + 4 patches"
+echo "done: ./ds4-server built from upstream ${FRESH} + 5 patches"
 echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

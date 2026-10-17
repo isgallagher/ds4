@@ -36,13 +36,47 @@
 #   upstream/pr1200.patch        PR #1200 @ d18057e — save eligible completed
 #                                text-only Qwen Responses prompts as a
 #                                `near-tail` checkpoint before generation.
+#   upstream/pr1212.patch        PR #1212 @ a05decc — fix the Qwen Chat tool-turn
+#                                disk checkpoint key for reasoning-echo
+#                                histories (fixes #1211): the turn used to
+#                                persist a reasoning-free alias, so the next
+#                                return could not match the checkpoint. Same
+#                                class as our 2026-10-16 20:12:17 and 20:35:32
+#                                misses.
+#   upstream/pr1216.patch        PR #1216 @ 402c80b — pick the LONGEST text-
+#                                prefix disk checkpoint in one pass instead of
+#                                the first one that beats the current best, and
+#                                stop re-hashing the prompt per candidate.
+#                                Measured need: 2026-10-16 20:35:32, where the
+#                                miss path knew the divergence sat at token
+#                                40297 and still loaded the 29580 checkpoint
+#                                (40,610 tokens re-prefilled).
 #   upstream/pr1221.patch        PR #1221 @ 2b720e8 — let the memory-text tier
 #                                survive images (fixes #1214: the request's
 #                                DS4_IMAGE_<nonce> marker vs the checkpoint's
 #                                expanded vision run made that tier dead).
+#   upstream/pr1197.patch        PR #1197 @ cea545e — accept WebP images on
+#                                macOS through ImageIO. Pasted/clipboard images
+#                                arrive as WebP and the server answered a
+#                                generic 400. Vision input fix, no new
+#                                dependency, Apple-only path.
 #
 #    Upstream tracker for A: issue #1201. Merge order there is
 #    1175 -> 1169 -> 1206 -> 1200, with "#1206 must merge after #1169".
+#    1212 and 1216 join that workstream from outside the tracker; 1197 is
+#    independent (image decode) and goes last.
+#
+#    Rejected from the same survey, with the reason (2026-10-16):
+#      #1170  checkpoint selection + eviction, 25 KB. Overlaps #1216 on the
+#             lookup we needed, conflicts with our 0002 disk guard (2 regions
+#             measured), and interacts with #1200. Revisit if #1216 proves
+#             insufficient.
+#      #1168  speculative-drafting backoff, 70 KB, 2 conflict regions. MTP is
+#             live here (--mtp); we hold --mtp-timing data to judge it on
+#             first.
+#      #1205  the GLM-5.3 only variant of our option C. Not applicable to Qwen.
+#      #1153  new --image-prefix-snapshot flag for issue #1007. Conflicts with
+#             0002; our 0004 already fixes the truncated-vision-block cause.
 #
 # B. Our own fixes (patches/):
 #
@@ -141,7 +175,10 @@ apply patches/upstream/pr1175.patch
 apply patches/upstream/pr1169.patch
 apply patches/upstream/pr1206-integrated.patch
 apply patches/upstream/pr1200.patch
+apply patches/upstream/pr1212.patch
+apply patches/upstream/pr1216.patch
 apply patches/upstream/pr1221.patch
+apply patches/upstream/pr1197.patch
 
 echo "applying local patches ..."
 apply patches/0001-responses-accept-nonterminal-status.patch
@@ -162,5 +199,5 @@ chmod +x ./ds4-server
 # at startup by macOS code signing ("Invalid Page" inside dyld). See
 # docs/BUILD_PATCHES.md §Swapping the live server.
 codesign --force -s - ./ds4-server
-echo "done: ./ds4-server built from upstream ${FRESH} + 5 upstream PR patches + 4 local patches"
+echo "done: ./ds4-server built from upstream ${FRESH} + 8 upstream PR patches + 4 local patches"
 echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

@@ -21,6 +21,9 @@ we build on while they wait for merge; group B is our own fixes.
 | A3 | `patches/upstream/pr1206-integrated.patch` | preserve the Qwen Responses live frontier when the client replays an emitted final-answer reasoning summary (and when it does not) | PR #1206 @ `a08bce5`, open — **stored integrated**, see §Why A3 is not the raw PR |
 | A4 | `patches/upstream/pr1200.patch` | save eligible completed text-only Qwen Responses prompts as a `near-tail` checkpoint before generation | PR #1200 @ `d18057e`, open |
 | A5 | `patches/upstream/pr1221.patch` | let the memory-text tier survive images (fixes #1214) | PR #1221 @ `2b720e8`, open |
+| A6 | `patches/upstream/pr1212.patch` | fix the Qwen Chat tool-turn disk checkpoint key for reasoning-echo histories (fixes #1211) — the turn persisted a reasoning-free alias, so the next return could not match it | PR #1212 @ `a05decc`, open |
+| A7 | `patches/upstream/pr1216.patch` | pick the **longest** text-prefix disk checkpoint in one pass, and stop re-hashing the prompt per candidate | PR #1216 @ `402c80b`, open |
+| A8 | `patches/upstream/pr1197.patch` | accept WebP images on macOS through ImageIO (a pasted WebP used to answer a generic 400) | PR #1197 @ `cea545e`, open |
 | B1 | `patches/0001-responses-accept-nonterminal-status.patch` | accept non-terminal item status + drop unknown item types on Responses replay (the "400 API" fix) | ours, no PR |
 | B2 | `patches/0002-responses-heal-forked-checkpoint.patch` | fork-heal in the miss path | ours, **PR antirez/ds4#1194** (draft) |
 | B3 | `patches/0003-responses-cache-miss-probe.patch` | `DS4_CACHE_MISS_DEBUG=1` first-diff window on a miss (diagnostic only) | ours, diagnostic |
@@ -28,7 +31,19 @@ we build on while they wait for merge; group B is our own fixes.
 
 - **Tracker for group A:** upstream issue #1201. Its merge order is
   `1175 → 1169 → 1206 → 1200`, with "#1206 must merge after #1169" (it relies on
-  #1169's EOS commitment). `build.sh` applies in that order.
+  #1169's EOS commitment). A6 and A7 join that workstream from outside the
+  tracker; A8 is independent (image decode) and applies last. `build.sh` applies
+  `1175 → 1169 → 1206 → 1200 → 1212 → 1216 → 1221 → 1197`.
+- **Rejected from the 2026-10-16 survey, with the reason** (so the next survey
+  does not re-open them without new evidence):
+  - **#1170** — checkpoint selection + eviction, 25 KB. Overlaps A7 on the lookup
+    we needed, conflicts with B2 at the disk guard (2 regions measured), and
+    interacts with #1200. Revisit only if A7 proves insufficient.
+  - **#1168** — speculative-drafting backoff, 70 KB, 2 conflict regions. We run
+    `--mtp`; judge it on our own `--mtp-timing` data first.
+  - **#1205** — the GLM-5.3-only variant of our option C. Not applicable to Qwen.
+  - **#1153** — `--image-prefix-snapshot` for issue #1007. Conflicts with B2; B4
+    already fixes the truncated-vision-block cause.
 - **Archive:** `patches/archive/0005-…superseded-by-pr-1206.patch` is our FIX-1
   (carry final-answer reasoning in the visible suffix). #1206 fixes the same bug
   with a two-key design that also covers clients that omit the reasoning, and it

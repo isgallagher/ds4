@@ -1,0 +1,1102 @@
+diff --git a/.gitignore b/.gitignore
+index b60b89c..19d407b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -114,3 +114,6 @@ __pycache__/
+ 
+ /tests/test_qwen4_conv_parallel
+ /tests/test_q8_prefill_variants
++
++/tests/test_kvstore_near_tail
++/tests/test_qwen4_prompt_checkpoint
+diff --git a/Makefile b/Makefile
+index c0ef50b..c76b603 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1250,6 +1250,32 @@ test-frontends: ds4_test ds4_agent_test test-web-recovery
+ 	./ds4_test --server
+ 	./ds4_agent_test
+ 
++# Optional real Qwen Metal state/logit gate; never run by default make test.
++QWEN4_CHECKPOINT_PROMPT ?= tests/long_context_story_prompt.txt
++QWEN4_CHECKPOINT_PREFIX ?= 16384
++QWEN4_CHECKPOINT_APPEND ?= 8
++.PHONY: test-qwen4-prompt-checkpoint
++test-qwen4-prompt-checkpoint: tests/test_qwen4_prompt_checkpoint
++	@test -n "$(QWEN4_CHECKPOINT_OUTPUT)" || { echo "Set QWEN4_CHECKPOINT_OUTPUT to a fresh test directory"; exit 2; }
++	./tests/test_qwen4_prompt_checkpoint "$(DS4_TEST_MODEL)" "$(QWEN4_CHECKPOINT_PROMPT)" "$(QWEN4_CHECKPOINT_PREFIX)" "$(QWEN4_CHECKPOINT_APPEND)" "$(QWEN4_CHECKPOINT_OUTPUT)"
++
++tests/test_qwen4_prompt_checkpoint.o: tests/test_qwen4_prompt_checkpoint.c ds4.h ds4_kvstore.h
++	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
++
++tests/test_qwen4_prompt_checkpoint: tests/test_qwen4_prompt_checkpoint.o ds4_kvstore.o $(CORE_OBJS)
++ifeq ($(UNAME_S),Darwin)
++	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
++else
++	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
++endif
++
++.PHONY: test-kvstore-near-tail
++test-kvstore-near-tail: tests/test_kvstore_near_tail
++	./tests/test_kvstore_near_tail
++
++tests/test_kvstore_near_tail: tests/test_kvstore_near_tail.c ds4_kvstore.c ds4_kvstore.h ds4.h
++	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -DDS4_NO_GPU -I. -o $@ $< -lm -pthread
++
+ .PHONY: test-web-recovery
+ test-web-recovery: tests/test_web_recovery
+ 	python3 tests/test_web_recovery.py ./tests/test_web_recovery
+@@ -1259,7 +1285,7 @@ tests/test_web_recovery: tests/test_web_recovery.c ds4_web.c ds4_web.h
+ 
+ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery \
+ 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
+-	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
++	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) test-kvstore-near-tail ds4 ds4-server ds4-bench ds4-agent
+ 	./ds4-eval --validate-cases
+ 	./ds4-eval --self-test-extractors
+ 	./ds4_agent_test
+@@ -1323,6 +1349,8 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
+ tests/test_session_state_gpu.o: ds4_tool_text.h
+ 
+ clean:
++	rm -f tests/test_qwen4_prompt_checkpoint tests/test_qwen4_prompt_checkpoint.o
++	rm -f tests/test_kvstore_near_tail
+ 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
+ 	rm -f tests/test_qwen4_ngrams
+ 	rm -f tests/test_qwen4_ngram_state
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index d9d3311..bfd3b38 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -179,6 +179,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
+     if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
+     if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
+     if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
++    if (!strcmp(reason, "near-tail")) return DS4_KVSTORE_REASON_NEAR_TAIL;
+     return DS4_KVSTORE_REASON_UNKNOWN;
+ }
+ 
+@@ -428,7 +429,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
+         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
+     if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
+     e->quant_bits = h[4];
+-    e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
++    e->reason = h[5] <= DS4_KVSTORE_REASON_NEAR_TAIL ? h[5] :
+                 DS4_KVSTORE_REASON_UNKNOWN;
+     e->ext_flags = h[6];
+     e->model_id = h[7];
+@@ -541,6 +542,8 @@ double ds4_kvstore_entry_eviction_score(
+         uint64_t now,
+         const ds4_kvstore_eviction_context *incoming) {
+     if (!e || e->file_size == 0) return 0.0;
++    /* Supplementary snapshots must leave before any ordinary checkpoint. */
++    if (e->reason == DS4_KVSTORE_REASON_NEAR_TAIL) return 0.0;
+     (void)live;
+     double effective_hits = (double)e->hits;
+     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
+@@ -926,6 +929,101 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
+     (void)ok;
+ }
+ 
++/* Supplementary storage: no ordinary entry is removed to
++ * admit a tail. At most two published tails use at most one eighth of budget,
++ * capped at 16 GiB. Existing atomic publication completes before pruning.
++ * A replacement temporarily needs room for both old and new published files. */
++static bool kv_cache_refresh_checked(ds4_kvstore *kc) {
++    ds4_kvstore_clear(kc);
++    DIR *dir = opendir(kc->dir);
++    if (!dir) return false;
++    bool ok = true;
++    struct dirent *de;
++    for (;;) {
++        errno = 0;
++        de = readdir(dir);
++        if (!de) { if (errno) ok = false; break; }
++        char sha[41];
++        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
++        char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
++        ds4_kvstore_entry entry = {0};
++        ok = ds4_kvstore_read_entry_file(path, sha, &entry);
++        free(path);
++        if (!ok) break;
++        kv_cache_push(kc, entry);
++    }
++    if (closedir(dir) != 0) ok = false;
++    return ok;
++}
++
++static uint64_t kv_cache_tail_budget(const ds4_kvstore *kc) {
++    const uint64_t cap = 16ull * 1024ull * 1024ull * 1024ull;
++    const uint64_t share = kc->budget_bytes / 8u;
++    return share < cap ? share : cap;
++}
++
++static bool kv_cache_tail_admit(ds4_kvstore *kc, uint64_t published, uint64_t required) {
++    if (!kc->budget_bytes || published > kv_cache_tail_budget(kc)) return false;
++    if (!kv_cache_refresh_checked(kc)) return false;
++    uint64_t total = 0;
++    for (int i = 0; i < kc->len; i++) {
++        if (UINT64_MAX - total < kc->entry[i].file_size) return false;
++        total += kc->entry[i].file_size;
++    }
++    return total <= kc->budget_bytes && required <= kc->budget_bytes - total;
++}
++
++static bool kv_cache_tail_prune(ds4_kvstore *kc, const char *keep) {
++    if (!kv_cache_refresh_checked(kc)) return false;
++    uint64_t bytes = 0;
++    int count = 0;
++    bool seen_keep = false;
++    for (int i = 0; i < kc->len; i++) {
++        if (kc->entry[i].reason != DS4_KVSTORE_REASON_NEAR_TAIL) continue;
++        if (!strcmp(kc->entry[i].path, keep)) seen_keep = true;
++        if (UINT64_MAX - bytes < kc->entry[i].file_size) return false;
++        bytes += kc->entry[i].file_size;
++        count++;
++    }
++    if (!seen_keep) return false;
++    while (count > 2 || bytes > kv_cache_tail_budget(kc)) {
++        int victim = -1;
++        for (int i = 0; i < kc->len; i++) {
++            ds4_kvstore_entry *e = &kc->entry[i];
++            if (e->reason != DS4_KVSTORE_REASON_NEAR_TAIL || !strcmp(e->path, keep)) continue;
++            if (victim < 0 || e->last_used < kc->entry[victim].last_used ||
++                (e->last_used == kc->entry[victim].last_used && strcmp(e->sha, kc->entry[victim].sha) < 0)) victim = i;
++        }
++        if (victim < 0) return false;
++        ds4_kvstore_entry *e = &kc->entry[victim];
++        if (unlink(e->path) != 0) return false;
++        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                "%s: kv cache evicted reason=near-tail-bound tokens=%u size=%.2f MiB file=%s",
++                kv_log_name(kc), e->tokens, (double)e->file_size / (1024.0 * 1024.0), e->path);
++        bytes -= e->file_size;
++        count--;
++        ds4_kvstore_entry_free(e);
++        kc->entry[victim] = kc->entry[--kc->len];
++    }
++    return true;
++}
++
++static bool kv_cache_tail_promote(const char *path, uint8_t reason) {
++    FILE *fp = fopen(path, "rb");
++    if (!fp) return false;
++    ds4_kvstore_entry entry = {0};
++    uint32_t text_bytes = 0;
++    bool ok = ds4_kvstore_read_header(fp, &entry, &text_bytes);
++    if (fclose(fp) != 0) ok = false;
++    if (!ok || entry.reason != DS4_KVSTORE_REASON_NEAR_TAIL) return ok;
++    fp = fopen(path, "r+b");
++    if (!fp) return false;
++    /* Only the policy reason changes. The exact payload/key are retained. */
++    ok = fseek(fp, 5, SEEK_SET) == 0 && fputc(reason, fp) != EOF && fflush(fp) == 0;
++    if (fclose(fp) != 0) ok = false;
++    return ok;
++}
++
+ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+                                         ds4_engine *engine,
+                                         ds4_session *session,
+@@ -1000,9 +1098,33 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+     char *path = ds4_kvstore_path_for_sha(kc, sha);
+     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
+ 
+-    if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
++    if (reason_code == DS4_KVSTORE_REASON_NEAR_TAIL) {
++        struct stat existing;
++        if (stat(path, &existing) == 0) {
++            /* Supplementary writes neither replace incompatible published
++             * anchors nor rewrite compatible payloads/trailers. */
++            ds4_kvstore_entry entry = {0};
++            bool compatible = ds4_kvstore_read_entry_file(path, sha, &entry) &&
++                entry.model_id == (uint8_t)model_id &&
++                (!kc->reject_different_quant || entry.quant_bits == (uint8_t)quant_bits) &&
++                entry.ctx_size <= (uint32_t)ds4_session_ctx(session) &&
++                kv_cache_file_text_matches(path, sha, text, text_len);
++            ds4_kvstore_entry_free(&entry);
++            free(text); free(path); ds4_tokens_free(&store_tokens);
++            return compatible;
++        }
++        if (errno != ENOENT) {
++            free(text); free(path); ds4_tokens_free(&store_tokens);
++            return false;
++        }
++    } else if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
+                                      model_id,
+                                      quant_bits, ds4_session_ctx(session))) {
++        if (!kv_cache_tail_promote(path, reason_code)) {
++            kv_logf(kc, DS4_KVSTORE_LOG_WARNING, "%s: kv cache promotion failed file=%s", kv_log_name(kc), path);
++            free(text); free(path); ds4_tokens_free(&store_tokens);
++            return false;
++        }
+         kv_cache_rewrite_trailer(kc, path, text, hooks);
+         free(text);
+         free(path);
+@@ -1010,6 +1132,21 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+         return true;
+     }
+ 
++    if (reason_code == DS4_KVSTORE_REASON_NEAR_TAIL) {
++        uint64_t payload_est = ds4_session_payload_bytes(session);
++        uint64_t file_est = 0, required_est = 0;
++        if (!payload_est ||
++            !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_est,
++                                       trailer_est_bytes, &file_est, &required_est) ||
++            !kv_cache_tail_admit(kc, file_est, required_est)) {
++            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                    "%s: kv cache skipped tokens=%d reason=near-tail because supplementary admission has no room",
++                    kv_log_name(kc), store_tokens.len);
++            free(text); free(path); ds4_tokens_free(&store_tokens);
++            return false;
++        }
++    }
++
+     ds4_session_payload_file staged = {0};
+     if (ds4_session_stage_payload(session, &staged,
+                                   save_err, sizeof(save_err)) != 0) {
+@@ -1055,7 +1192,18 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+         .ctx_size = (uint32_t)ds4_session_ctx(session),
+         .reject_different_quant = kc->reject_different_quant,
+     };
+-    ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
++    if (reason_code == DS4_KVSTORE_REASON_NEAR_TAIL) {
++        if (!kv_cache_tail_admit(kc, est_file_bytes, est_required_bytes)) {
++            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                    "%s: kv cache skipped tokens=%d reason=near-tail because supplementary admission has no room",
++                    kv_log_name(kc), store_tokens.len);
++            ds4_session_payload_file_free(&staged);
++            free(text); free(path); ds4_tokens_free(&store_tokens);
++            return false;
++        }
++    } else {
++        ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
++    }
+ 
+     kv_buf tmpb = {0};
+     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
+@@ -1110,10 +1258,28 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+         final_size_over_budget = true;
+         ok = false;
+     }
++    /* Trailer hooks may have changed size since the estimate. Recheck
++     * admission before publication, while all prior files remain intact. */
++    if (ok && reason_code == DS4_KVSTORE_REASON_NEAR_TAIL &&
++        !kv_cache_tail_admit(kc, final_file_bytes, final_required_bytes)) {
++        saved_errno = ENOSPC;
++        ok = false;
++    }
+     if (ok && rename(tmp, path) != 0) {
+         saved_errno = errno;
+         ok = false;
+     }
++    if (ok && reason_code == DS4_KVSTORE_REASON_NEAR_TAIL && !kv_cache_tail_prune(kc, path)) {
++        saved_errno = errno ? errno : EIO;
++        /* A failed bound operation cannot silently retain an unbounded tail.
++         * Only this newly published supplementary path may be rolled back. */
++        if (unlink(path) != 0 && errno != ENOENT) {
++            kv_logf(kc, DS4_KVSTORE_LOG_WARNING,
++                    "%s: kv cache near-tail rollback failed file=%s: %s",
++                    kv_log_name(kc), path, strerror(errno));
++        }
++        ok = false;
++    }
+     const double save_ms = (kv_now_sec() - save_t0) * 1000.0;
+     if (!ok) {
+         if (final_size_over_budget) {
+diff --git a/ds4_kvstore.h b/ds4_kvstore.h
+index a80e45b..11af323 100644
+--- a/ds4_kvstore.h
++++ b/ds4_kvstore.h
+@@ -25,6 +25,7 @@ typedef enum {
+     DS4_KVSTORE_REASON_SHUTDOWN  = 4,
+     DS4_KVSTORE_REASON_AGENT_SYSTEM  = 5,
+     DS4_KVSTORE_REASON_AGENT_SESSION = 6,
++    DS4_KVSTORE_REASON_NEAR_TAIL = 7, /* Supplementary completed prompt frontier. */
+ } ds4_kvstore_reason;
+ 
+ typedef enum {
+diff --git a/ds4_server.c b/ds4_server.c
+index b88aa44..a20f7d0 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -10160,6 +10160,7 @@ struct server {
+     pthread_cond_t model_cv;
+     bool model_busy;
+     bool qwen4_batch_mtp;
++    bool prompt_tail_cache; /* Qualified Metal prompt checkpoint policy. */
+     bool model_stopping;
+     int decode_pending;
+     int active_generations;
+@@ -11294,6 +11295,30 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
+                                            NULL, 0, NULL);
+ }
+ 
++/* Persist an already reached prompt frontier before the new
++ * sampled reasoning/output can make its visible key differ from replay.
++ * The effective exact tokens remain in the payload; Responses prompt bytes
++ * bind that state exactly as the existing Responses-visible checkpoint does.
++ * No split sync, rewind, changed geometry or periodic-schedule suppression. */
++static void kv_cache_maybe_store_prompt_tail(server *s, server_slot *slot,
++                                        const request *req,
++                                        const ds4_tokens *prompt, int cached,
++                                        int cold_saved_tokens) {
++    if (!s->prompt_tail_cache || !s->kv.enabled ||
++        !ds4_engine_is_qwen4(s->engine) || req->api != API_RESPONSES ||
++        req->image_count || !req->prompt_text || !req->prompt_text[0] ||
++        !prompt || prompt->len < s->kv.opt.min_tokens) return;
++    /* Only frontiers known to belong to this request count as coverage.
++     * The slot's periodic counter can belong to a different disk-hit branch. */
++    int covered = cached > cold_saved_tokens ? cached : cold_saved_tokens;
++    uint32_t chunk = ds4_engine_prefill_chunk(s->engine);
++    if (!chunk || covered < 0 || prompt->len <= covered ||
++        (uint32_t)(prompt->len - covered) < chunk) return;
++    (void)kv_cache_store_live_prefix_text(s, slot, prompt, prompt->len,
++                                         "near-tail", req->prompt_text,
++                                         KV_EXT_RESPONSES_VISIBLE, "responses-prompt");
++}
++
+ static void kv_cache_store_current(server *s, server_slot *slot,
+                                    const char *reason) {
+     if (!s || !slot) return;
+@@ -13703,6 +13728,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
+     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
+ 
++    bool cold_saved = false;
+     int cold_store_len = 0;
+     if (!multimodal && cached == 0 &&
+         s->kv.enabled &&
+@@ -13754,6 +13780,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+         }
+         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+                                        cold_store_len, "cold")) {
++            cold_saved = true;
+             kv_cache_slot_note_store(slot, cold_store_len);
+             suppressed_continued_last = -1;
+         } else {
+@@ -13813,6 +13840,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+     if (cold_store_len == prompt_for_sync->len) {
+         if (!multimodal && kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+                                        cold_store_len, "cold")) {
++            cold_saved = true;
+             kv_cache_slot_note_store(slot, cold_store_len);
+             suppressed_continued_last = -1;
+         } else {
+@@ -13820,6 +13848,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+                                              cold_store_len);
+         }
+     }
++    if (!multimodal) kv_cache_maybe_store_prompt_tail(s, slot, &j->req, prompt_for_sync, cached, cold_saved ? cold_store_len : 0);
+     char id[96];
+     responses_random_id(id, sizeof(id),
+                         j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
+@@ -15945,6 +15974,7 @@ int main(int argc, char **argv) {
+     s.ctx_size = cfg.ctx_size;
+     s.slot_count = slot_count;
+     s.batched_mode = cfg.batched_sessions > 0;
++    s.prompt_tail_cache = cfg.engine.backend == DS4_BACKEND_METAL;
+     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
+                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
+     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
+diff --git a/tests/test_kvstore_near_tail.c b/tests/test_kvstore_near_tail.c
+new file mode 100644
+index 0000000..6515ebe
+--- /dev/null
++++ b/tests/test_kvstore_near_tail.c
+@@ -0,0 +1,465 @@
++/* Actual supplementary kvstore regression. Tiny mock session payloads
++ * exercise file publication, eligibility and ownership, not model arithmetic. */
++#include "ds4.h"
++#include <assert.h>
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <dirent.h>
++struct ds4_engine {
++    int qwen;
++    int model_id;
++};
++struct ds4_session {
++    ds4_tokens tokens;
++    uint32_t state[4];
++};
++static char fixture_dir[256];
++static bool override_payload_size;
++static uint64_t reported_payload_bytes;
++static int fail_stage, fail_write, fail_rename, stage_calls;
++static int fail_dir,fail_read_dir;
++static const char *fail_unlink_path;
++static const char *fail_update_path,*fail_read_path;
++static int fixture_rename(const char *from, const char *to) {
++    if (fail_rename) {
++        errno=EIO;
++        return -1;
++    }
++    return rename(from,to);
++}
++static DIR *fixture_opendir(const char *path){
++    if(fail_dir){
++        errno=EACCES;
++        return NULL;
++    }
++    return opendir(path);
++}
++static struct dirent *fixture_readdir(DIR *dir){
++    if(fail_read_dir){
++        errno=EIO;
++        return NULL;
++    }
++    return readdir(dir);
++}
++static int fixture_unlink(const char *path){
++    if(fail_unlink_path&&!strcmp(path,fail_unlink_path)){
++        errno=EIO;
++        return -1;
++    }
++    return unlink(path);
++}
++static FILE *fixture_fopen(const char *path,const char *mode){
++    if((fail_update_path&&!strcmp(path,fail_update_path)&&!strcmp(mode,"r+b"))||(fail_read_path&&!strcmp(path,fail_read_path)&&!strcmp(mode,"rb"))){
++        errno=EACCES;
++        return NULL;
++    }
++    return fopen(path,mode);
++}
++#define rename fixture_rename
++#define opendir fixture_opendir
++#define readdir fixture_readdir
++#define unlink fixture_unlink
++#define fopen fixture_fopen
++#include "../ds4_kvstore.c"
++#undef rename
++#undef opendir
++#undef readdir
++#undef unlink
++#undef fopen
++void ds4_tokens_push(ds4_tokens *t,int x) {
++    if(t->len==t->cap){
++        t->cap=t->cap?t->cap*2:16;
++        t->v=realloc(t->v,(size_t)t->cap*sizeof(int));
++        assert(t->v);
++    }
++    t->v[t->len++]=x;
++}
++void ds4_tokens_free(ds4_tokens *t){
++    free(t->v);
++    memset(t,0,sizeof(*t));
++}
++void ds4_tokens_copy(ds4_tokens *to,const ds4_tokens *from){
++    to->len=0;
++    for(int i=0;i<from->len;i++)ds4_tokens_push(to,from->v[i]);
++}
++bool ds4_tokens_starts_with(const ds4_tokens *t,const ds4_tokens *p){
++    return t->len>=p->len&&!memcmp(t->v,p->v,(size_t)p->len*sizeof(int));
++}
++int ds4_engine_routed_quant_bits(ds4_engine *e){
++    (void)e;
++    return 4;
++}
++int ds4_engine_model_id(ds4_engine *e){
++    return e->model_id;
++}
++bool ds4_engine_is_qwen4(ds4_engine *e){
++    return e->qwen!=0;
++}
++uint32_t ds4_engine_prefill_chunk(ds4_engine *e){
++    (void)e;
++    return 8192;
++}
++int ds4_token_eos(ds4_engine *e){
++    (void)e;
++    return -1;
++}
++char *ds4_token_text(ds4_engine *e,int id,size_t *n){
++    (void)e;
++    char *p=malloc(2);
++    assert(p);
++    p[0]=(char)('a'+id%26);
++    p[1]=0;
++    *n=1;
++    return p;
++}
++void ds4_tokenize_rendered_chat(ds4_engine *e,const char *s,ds4_tokens *t){
++    (void)e;
++    for(;*s;s++)ds4_tokens_push(t,(unsigned char)*s);
++}
++const ds4_tokens *ds4_session_tokens(ds4_session *s){
++    return &s->tokens;
++}
++int ds4_session_ctx(ds4_session *s){
++    (void)s;
++    return 262144;
++}
++void ds4_session_invalidate(ds4_session *s){
++    s->tokens.len=0;
++}
++uint64_t ds4_session_payload_bytes(ds4_session *s) {
++    return override_payload_size ? reported_payload_bytes : 4ull + 4ull * s->tokens.len + 16ull;
++}
++int ds4_session_stage_payload(ds4_session *s,ds4_session_payload_file *out,char *err,size_t cap){
++    (void)err;
++    (void)cap;
++    stage_calls++;
++    if(fail_stage)return 1;
++    char path[300];
++    snprintf(path,sizeof(path),"%s/staged-XXXXXX",fixture_dir);
++    int fd=mkstemp(path);
++    assert(fd>=0);
++    FILE *f=fdopen(fd,"wb");
++    assert(f);
++    uint32_t n=(uint32_t)s->tokens.len;
++    assert(fwrite(&n,4,1,f)==1);
++    assert(fwrite(s->tokens.v,4,n,f)==n);
++    assert(fwrite(s->state,4,4,f)==4);
++    assert(!fclose(f));
++    out->path=strdup(path);
++    out->bytes=4ull+4ull*n+16ull;
++    return 0;
++}
++int ds4_session_write_staged_payload(const ds4_session_payload_file *p,FILE *out,char *err,size_t cap){
++    (void)err;
++    (void)cap;
++    FILE *f=fopen(p->path,"rb");
++    assert(f);
++    unsigned char buf[512];
++    uint64_t left=p->bytes;
++    if(fail_write){
++        assert(fwrite("partial",1,7,out)==7);
++        fclose(f);
++        errno=EIO;
++        return 1;
++    }
++    while(left){
++        size_t n=left<sizeof(buf)?(size_t)left:sizeof(buf);
++        assert(fread(buf,1,n,f)==n);
++        assert(fwrite(buf,1,n,out)==n);
++        left-=n;
++    }fclose(f);
++    return 0;
++}
++void ds4_session_payload_file_free(ds4_session_payload_file *p){
++    if(p->path){
++        assert(!unlink(p->path));
++        free(p->path);
++    }memset(p,0,sizeof(*p));
++}
++int ds4_session_load_payload(ds4_session *s,FILE *f,uint64_t bytes,char *err,size_t cap){
++    (void)err;
++    (void)cap;
++    uint32_t n=0;
++    if(fread(&n,4,1,f)!=1||bytes!=4ull+4ull*n+16ull)return 1;
++    s->tokens.len=0;
++    for(uint32_t i=0;i<n;i++){
++        int x;
++        if(fread(&x,4,1,f)!=1)return 1;
++        ds4_tokens_push(&s->tokens,x);
++    }
++    return fread(s->state,4,4,f)==4?0:1;
++}
++static bool growing_trailer_size(void *ud, const char *text, uint64_t *bytes) {
++    (void)ud;
++    (void)text;
++    *bytes=1;
++    return true;
++}
++
++static bool growing_trailer_write(void *ud, FILE *fp, const char *text,
++                                  uint64_t *bytes) {
++    (void)ud;
++    (void)text;
++    const unsigned char zero[1024]={0};
++    *bytes=0;
++    for(int i=0;i<200;i++) {
++        if(fwrite(zero,1,sizeof(zero),fp)!=sizeof(zero))return false;
++        *bytes+=sizeof(zero);
++    }
++    return true;
++}
++
++static bool store(ds4_kvstore *k,ds4_engine *e,ds4_session *s,const char *text,const char *why){
++    char err[160];
++    return ds4_kvstore_store_live_prefix_text(k,e,s,&s->tokens,s->tokens.len,why,text,DS4_KVSTORE_EXT_RESPONSES_VISIBLE,"responses-prompt",NULL,err,sizeof(err));
++}
++static char *key_path(ds4_kvstore *k,const char *text){
++    char sha[41];
++    ds4_kvstore_sha1_bytes_hex(text,strlen(text),sha);
++    return ds4_kvstore_path_for_sha(k,sha);
++}
++static void limits(ds4_kvstore *k){
++    kv_cache_refresh(k);
++    uint64_t n=0;
++    int c=0;
++    for(int i=0;i<k->len;i++)if(k->entry[i].reason==DS4_KVSTORE_REASON_NEAR_TAIL){
++        c++;
++        n+=k->entry[i].file_size;
++    }assert(c<=2&&n<=kv_cache_tail_budget(k));
++}
++static unsigned char *file_bytes(const char *path,size_t *n){
++    struct stat st;
++    assert(!stat(path,&st));
++    *n=(size_t)st.st_size;
++    unsigned char *p=malloc(*n);
++    assert(p);
++    FILE *f=fopen(path,"rb");
++    assert(f&&fread(p,1,*n,f)==*n);
++    fclose(f);
++    return p;
++}
++int main(void){
++    strcpy(fixture_dir,"/tmp/ds4-kvstore-tail-XXXXXX");
++    assert(mkdtemp(fixture_dir));
++    ds4_engine e={
++        .qwen=1
++    };
++    ds4_session s={
++        0
++    },loaded={
++        0
++    };
++    for(int i=0;i<512;i++)ds4_tokens_push(&s.tokens,i%26);
++    uint32_t state[4]={
++        0x80000000,0x3f800001,0x7f7fffff,0x00000001
++    };
++    memcpy(s.state,state,sizeof(state));
++    ds4_kvstore k={
++        0
++    };
++    ds4_kvstore_options opt=ds4_kvstore_default_options();
++    assert(ds4_kvstore_open(&k,fixture_dir,1,false,opt,"kvstore-test",NULL,NULL));
++    assert(store(&k,&e,&s,"ordinary","cold"));
++    char *ordinary=key_path(&k,"ordinary");
++    struct stat old;
++    assert(!stat(ordinary,&old));
++    assert(store(&k,&e,&s,"prefix-A","near-tail"));
++    char *a=key_path(&k,"prefix-A");
++    assert(store(&k,&e,&s,"prefix-B","near-tail"));
++    char *b=key_path(&k,"prefix-B");
++    limits(&k);
++    /* Failed staging/write/rename leaves both prior tails and ordinary anchor. */
++    for(int i=0;i<3;i++){
++        fail_stage=i==0;
++        fail_write=i==1;
++        fail_rename=i==2;
++        assert(!store(&k,&e,&s,"failed","near-tail"));
++        assert(!access(a,F_OK)&&!access(b,F_OK)&&!access(ordinary,F_OK));
++        limits(&k);
++    }fail_stage=fail_write=fail_rename=0;
++    fail_dir=1;
++    assert(!store(&k,&e,&s,"dir-failure","near-tail"));
++    fail_dir=0;
++    fail_read_dir=1;
++    assert(!store(&k,&e,&s,"read-dir-failure","near-tail"));
++    fail_read_dir=0;
++    limits(&k);
++    fail_read_path=ordinary;
++    assert(!store(&k,&e,&s,"unreadable-inventory","near-tail"));
++    fail_read_path=NULL;
++    assert(!access(ordinary,F_OK));
++    limits(&k);
++    char badpath[300];
++    snprintf(badpath,sizeof(badpath),"%s/0000000000000000000000000000000000000000.kv",fixture_dir);
++    FILE *bad=fopen(badpath,"wb");
++    assert(bad&&fwrite("bad",1,3,bad)==3&&!fclose(bad));
++    assert(!store(&k,&e,&s,"bad-inventory","near-tail"));
++    assert(!access(ordinary,F_OK));
++    assert(!unlink(badpath));
++    limits(&k);
++    /* Fail the precise first prune victim: new path rolls back, old tails stay. */
++    kv_cache_refresh(&k);
++    const ds4_kvstore_entry *victim=NULL;
++    for(int i=0;i<k.len;i++)if(k.entry[i].reason==DS4_KVSTORE_REASON_NEAR_TAIL&&(!victim||k.entry[i].last_used<victim->last_used||(k.entry[i].last_used==victim->last_used&&strcmp(k.entry[i].sha,victim->sha)<0)))victim=&k.entry[i];
++    assert(victim);
++    char *vpath=strdup(victim->path);
++    fail_unlink_path=vpath;
++    assert(!store(&k,&e,&s,"prune-failure","near-tail"));
++    fail_unlink_path=NULL;
++    free(vpath);
++    assert(!access(a,F_OK)&&!access(b,F_OK)&&!access(ordinary,F_OK));
++    char *failed=key_path(&k,"prune-failure");
++    assert(access(failed,F_OK));
++    free(failed);
++    limits(&k);
++    /* Compatible ordinary read-only duplicate is neither demoted nor rewritten. */
++    assert(!chmod(ordinary,0400));
++    int stages=stage_calls;
++    assert(store(&k,&e,&s,"ordinary","near-tail"));
++    assert(stage_calls==stages);
++    struct stat now;
++    assert(!stat(ordinary,&now)&&old.st_size==now.st_size);
++    assert(!chmod(ordinary,0600));
++    /* The same visible key from another model cannot replace an anchor. */
++    size_t model_n1,model_n2;
++    unsigned char *model_before=file_bytes(ordinary,&model_n1);
++    e.model_id=1;
++    stages=stage_calls;
++    assert(!store(&k,&e,&s,"ordinary","near-tail")&&stage_calls==stages);
++    unsigned char *model_after=file_bytes(ordinary,&model_n2);
++    assert(model_n1==model_n2&&!memcmp(model_before,model_after,model_n1));
++    free(model_before);
++    free(model_after);
++    e.model_id=0;
++    /* Growing trailer can pass estimation but must fail final published cap. */
++    ds4_kvstore_trailer_hooks growing={.serialized_size=growing_trailer_size,
++                                      .write=growing_trailer_write};
++    char trailer_err[160];
++    stages=stage_calls;
++    assert(!ds4_kvstore_store_live_prefix_text(&k,&e,&s,&s.tokens,s.tokens.len,
++        "near-tail","growing-trailer",DS4_KVSTORE_EXT_RESPONSES_VISIBLE,
++        "responses-prompt",&growing,trailer_err,sizeof(trailer_err)));
++    char *grown_path=key_path(&k,"growing-trailer");
++    assert(stage_calls==stages+1&&access(grown_path,F_OK)&&!access(ordinary,F_OK));
++    free(grown_path);
++    limits(&k);
++    /* Incompatible published ordinary path is never unlinked or replaced. */
++    FILE *f=fopen(ordinary,"r+b");
++    assert(f);
++    assert(!fseek(f,16,SEEK_SET));
++    uint8_t ctx[4];
++    ds4_kvstore_le_put32(ctx,524288);
++    assert(fwrite(ctx,1,4,f)==4&&!fclose(f));
++    size_t n1,n2;
++    unsigned char *before=file_bytes(ordinary,&n1);
++    stages=stage_calls;
++    assert(!store(&k,&e,&s,"ordinary","near-tail"));
++    unsigned char *after=file_bytes(ordinary,&n2);
++    assert(n1==n2&&!memcmp(before,after,n1)&&stage_calls==stages);
++    free(before);
++    free(after);
++    f=fopen(ordinary,"r+b");
++    assert(f&&!fseek(f,16,SEEK_SET));
++    ds4_kvstore_le_put32(ctx,262144);
++    assert(fwrite(ctx,1,4,f)==4&&!fclose(f));
++    assert(store(&k,&e,&s,"prefix-C","near-tail"));
++    limits(&k);
++    assert(!access(ordinary,F_OK));
++    /* Prefix/hash and mock payload restoration, including exact f32 bit patterns. */
++    ds4_tokens effective={
++        0
++    };
++    ds4_kvstore_load_result result={
++        0
++    };
++    assert(ds4_kvstore_try_load_text(&k,&e,&loaded,"prefix-C-suffix",&effective,&result,NULL,true)==512);
++    assert(!memcmp(loaded.state,state,sizeof(state)));
++    assert(ds4_tokens_starts_with(&effective,&s.tokens)&&effective.len==519);
++    ds4_kvstore_load_result_free(&result);
++    ds4_tokens_free(&effective);
++    assert(ds4_kvstore_find_text_prefix(&k,"prefix-D",0,4,262144)<0);
++    /* All ordinary entries retain positive score; tails remain expendable after hits. */
++    kv_cache_refresh(&k);
++    for(int i=0;i<k.len;i++){
++        k.entry[i].hits=UINT32_MAX;
++        double x=ds4_kvstore_entry_eviction_score(&k.entry[i],NULL,(uint64_t)time(NULL),NULL);
++        assert(k.entry[i].reason==DS4_KVSTORE_REASON_NEAR_TAIL?x==0:x>0);
++    }
++    k.budget_bytes=1024;
++    stages=stage_calls;
++    assert(!store(&k,&e,&s,"too-large","near-tail"));
++    assert(!access(ordinary,F_OK));
++    assert(stage_calls==stages);
++    k.budget_bytes=1024*1024;
++    /* Reject known oversized/invalid supplementary payloads before readback.
++    * Test metadata sizes only; never allocate the represented payload. */
++    override_payload_size=true;
++    uint64_t sizes[]={
++        0, UINT64_MAX, 1024*1024
++    };
++    for(size_t i=0;i<sizeof(sizes)/sizeof(sizes[0]);i++){
++        reported_payload_bytes=sizes[i];
++        stages=stage_calls;
++        assert(!store(&k,&e,&s,"preflight-oversized","near-tail"));
++        assert(stage_calls==stages&&!access(ordinary,F_OK));
++    }
++    override_payload_size=false;
++    /* Large-size metadata boundary, no payload allocation or inference. */
++    k.budget_bytes=256000ull*1024*1024;
++    uint64_t cap16=16ull*1024*1024*1024;
++    assert(kv_cache_tail_admit(&k,cap16,cap16+cap16/100+1));
++    assert(!kv_cache_tail_admit(&k,cap16+1,cap16+cap16/100+2));
++    k.budget_bytes=1024*1024;
++    /* Same-key ordinary periodic store promotes policy without changing payload. */
++    char *c=key_path(&k,"prefix-C");
++    size_t cb1,cb2;
++    unsigned char *oldc=file_bytes(c,&cb1);
++    fail_update_path=c;
++    assert(!store(&k,&e,&s,"prefix-C","continued"));
++    fail_update_path=NULL;
++    unsigned char *failedc=file_bytes(c,&cb2);
++    assert(cb1==cb2&&!memcmp(oldc,failedc,cb1));
++    free(failedc);
++    assert(store(&k,&e,&s,"prefix-C","continued"));
++    unsigned char *newc=file_bytes(c,&cb2);
++    assert(cb1==cb2&&oldc[5]==DS4_KVSTORE_REASON_NEAR_TAIL&&newc[5]==DS4_KVSTORE_REASON_CONTINUED);
++    oldc[5]=newc[5];
++    assert(!memcmp(oldc,newc,cb1));
++    free(oldc);
++    free(newc);
++    free(c);
++    limits(&k);
++    /* Reopen retains reason/priority; old reason header values still parse. */
++    ds4_kvstore_close(&k);
++    assert(ds4_kvstore_open(&k,fixture_dir,1,false,opt,"kvstore-test",NULL,NULL));
++    limits(&k);
++    for(int reason=0;reason<=DS4_KVSTORE_REASON_AGENT_SESSION;reason++){
++        FILE *f=tmpfile();
++        assert(f);
++        uint8_t h[48],tb[4];
++        ds4_kvstore_fill_header(h,0,4,(uint8_t)reason,0,512,0,262144,1,1,0);
++        ds4_kvstore_le_put32(tb,0);
++        assert(fwrite(h,1,48,f)==48&&fwrite(tb,1,4,f)==4);
++        rewind(f);
++        ds4_kvstore_entry ent={
++            0
++        };
++        uint32_t size;
++        assert(ds4_kvstore_read_header(f,&ent,&size)&&ent.reason==reason);
++        fclose(f);
++    }
++    free(a);
++    free(b);
++    free(ordinary);
++    ds4_tokens_free(&s.tokens);
++    ds4_tokens_free(&loaded.tokens);
++    kv_cache_refresh(&k);
++    for(int i=0;i<k.len;i++)assert(!unlink(k.entry[i].path));
++    ds4_kvstore_close(&k);
++    assert(!rmdir(fixture_dir));
++    puts("KV supplementary checkpoint fixture PASS (mock payload; no model oracle)");
++    return 0;
++}
+diff --git a/tests/test_qwen4_prompt_checkpoint.c b/tests/test_qwen4_prompt_checkpoint.c
+new file mode 100644
+index 0000000..d72bb63
+--- /dev/null
++++ b/tests/test_qwen4_prompt_checkpoint.c
+@@ -0,0 +1,226 @@
++/* Optional real Qwen Metal checkpoint oracle; not part of default make test.
++ *
++ * Build: make tests/test_qwen4_prompt_checkpoint
++ * Run: ./tests/test_qwen4_prompt_checkpoint MODEL PROMPT PREFIX APPEND NEW_DIR
++ * Use tests/long_context_story_prompt.txt as PROMPT, PREFIX=16384 or 131072,
++ * and APPEND=1, 8 or 8192. Run the six combinations serially with no server or
++ * other model process. Native ctx262144/chunk8192, one active session at a time.
++ * The native Q4 matrix requires ample memory (128 GiB host used locally).
++ * NEW_DIR must not exist; retain five payload files plus the isolated cache.
++ * Allow room for several full states and temporary payload staging on disk.
++ *
++ * This compares valid serialized state and full logits at equal computational
++ * boundaries, including a nonzero-temperature speculative-API history frozen in-process.
++ * MTP capability is required; draft acceptance or cycle counts are not asserted.
++ * The opaque visible key/trailer tests storage transport; it does not test the
++ * HTTP renderer/tool-ID map or equivalence to ordinary sampled generation.
++ */
++#include "ds4.h"
++#include "ds4_kvstore.h"
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++static void check(int ok, const char *why) {
++    if (!ok) {
++        fprintf(stderr, "Qwen prompt checkpoint failed: %s\n", why);
++        exit(1);
++    }
++}
++
++static int number(const char *text) {
++    char *end;
++    long n = strtol(text, &end, 10);
++    check(text[0] && !*end && n >= 0 && n <= 131072, "integer argument");
++    return (int)n;
++}
++
++static void path_join(char *out, size_t cap, const char *dir, const char *name) {
++    int n = snprintf(out, cap, "%s/%s", dir, name);
++    check(n >= 0 && (size_t)n < cap, "output path length");
++}
++
++static char *read_text(const char *path) {
++    FILE *fp = fopen(path, "rb");
++    check(fp != NULL, "prompt open");
++    check(!fseek(fp, 0, SEEK_END), "prompt seek");
++    long n = ftell(fp);
++    check(n > 0 && !fseek(fp, 0, SEEK_SET), "prompt size");
++    char *text = malloc((size_t)n + 1);
++    check(text != NULL, "prompt allocation");
++    check(fread(text, 1, (size_t)n, fp) == (size_t)n, "prompt read");
++    text[n] = 0;
++    check(!fclose(fp), "prompt close");
++    return text;
++}
++
++static void logits(ds4_session *s, float *out, int vocab) {
++    check(ds4_session_copy_logits(s, out, vocab) == vocab, "logits copy");
++    for (int i = 0; i < vocab; i++) check(isfinite(out[i]), "finite logits");
++}
++
++static void save_payload(ds4_session *s, const char *path) {
++    FILE *fp = fopen(path, "wbx");
++    check(fp != NULL, "fresh payload file");
++    char err[256] = {0};
++    check(!ds4_session_save_payload(s, fp, err, sizeof(err)), err);
++    check(!fclose(fp), "payload close");
++}
++
++static void equal_payloads(const char *a, const char *b) {
++    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
++    check(fa && fb, "payload compare open");
++    unsigned char x[65536], y[65536];
++    for (;;) {
++        size_t nx = fread(x, 1, sizeof(x), fa), ny = fread(y, 1, sizeof(y), fb);
++        check(nx == ny && !memcmp(x, y, nx), "valid serialized payload changed");
++        if (nx < sizeof(x)) {
++            check(!ferror(fa) && !ferror(fb), "payload compare read");
++            break;
++        }
++    }
++    check(!fclose(fa) && !fclose(fb), "payload compare close");
++}
++
++static bool trailer_size(void *ud, const char *text, uint64_t *bytes) {
++    (void)ud; (void)text;
++    *bytes = 8;
++    return true;
++}
++
++static bool trailer_write(void *ud, FILE *fp, const char *text, uint64_t *bytes) {
++    (void)ud; (void)text;
++    *bytes = 8;
++    return fwrite("QWENMAP1", 1, 8, fp) == 8;
++}
++
++static int trailer_load(void *ud, FILE *fp, const void *wanted) {
++    (void)wanted;
++    char bytes[8];
++    check(fread(bytes, 1, 8, fp) == 8 && !memcmp(bytes, "QWENMAP1", 8), "trailer roundtrip");
++    (*(int *)ud)++;
++    return 1;
++}
++
++int main(int argc, char **argv) {
++    if (argc != 6) {
++        fprintf(stderr, "usage: %s MODEL PROMPT PREFIX APPEND(1|8|8192) NEW_DIR\n", argv[0]);
++        return 2;
++    }
++    int prefix = number(argv[3]), append = number(argv[4]);
++    check(prefix >= 16384 && prefix <= 131072 &&
++          (append == 1 || append == 8 || append == 8192), "arguments");
++    check(!mkdir(argv[5], 0700), "new output directory only");
++    char cache[4096], before[4096], after[4096], expected[4096], restored[4096], loaded_path[4096];
++    path_join(cache, sizeof(cache), argv[5], "kv");
++    path_join(before, sizeof(before), argv[5], "before.payload");
++    path_join(after, sizeof(after), argv[5], "after.payload");
++    path_join(expected, sizeof(expected), argv[5], "expected.payload");
++    path_join(restored, sizeof(restored), argv[5], "restored.payload");
++    path_join(loaded_path, sizeof(loaded_path), argv[5], "loaded.payload");
++    ds4_engine_options options = {
++        .model_path = argv[1], .backend = DS4_BACKEND_METAL, .n_threads = 1,
++        .context_size = 262144, .prefill_chunk = 8192, .warm_weights = true,
++        .glm_mtp = true, .dspark_exact_sampling = false,
++    };
++    ds4_engine *engine = NULL;
++    check(!ds4_engine_open(&engine, &options), "engine open");
++    check(ds4_engine_is_qwen4(engine), "Qwen model");
++    check(ds4_engine_mtp_draft_tokens(engine) > 1, "Qwen model with MTP support");
++    char *text = read_text(argv[2]);
++    ds4_tokens fixture = {0}, prompt = {0};
++    ds4_tokenize_text(engine, text, &fixture);
++    free(text);
++    check(fixture.len > 0, "nonempty fixture");
++    for (int i = 0; i < prefix; i++) ds4_tokens_push(&prompt, fixture.v[i % fixture.len]);
++    ds4_session *session = NULL;
++    char err[256] = {0};
++    check(!ds4_session_create(&session, engine, 262144), "session create");
++    check(!ds4_session_sync(session, &prompt, err, sizeof(err)), err);
++    uint64_t rng = 12345;
++    int generated = 0;
++    while (generated < 32) {
++        int token = ds4_session_sample(session, 0.6f, 0, 1.0f, 0.05f, &rng);
++        check(token >= 0, "sample");
++        int ids[4];
++        int n = ds4_session_eval_speculative(session, token, 32 - generated, -1,
++                  0.6f, 0, 1.0f, 0.05f, &rng, ids, 4, err, sizeof(err));
++        check(n > 0 && n <= 4 && n <= 32 - generated, "speculative history count");
++        generated += n;
++    }
++    ds4_tokens frontier = {0};
++    ds4_tokens_copy(&frontier, ds4_session_tokens(session));
++    check(frontier.len == prefix + 32, "history frontier length");
++    int vocab = ds4_engine_vocab_size(engine);
++    size_t row_bytes = (size_t)vocab * sizeof(float);
++    float *start = malloc(row_bytes), *a = malloc(row_bytes);
++    float *b = malloc(row_bytes), *next_row = malloc(row_bytes);
++    check(start && a && b && next_row, "row allocation");
++    logits(session, start, vocab);
++    save_payload(session, before);
++    ds4_kvstore store = {0};
++    check(ds4_kvstore_open(&store, cache, 256000, false,
++          ds4_kvstore_default_options(), "qwen-checkpoint-test", NULL, NULL), "cache open");
++    int trailer_seen = 0;
++    ds4_kvstore_trailer_hooks hooks = {
++        .ud = &trailer_seen, .ext_flag = DS4_KVSTORE_EXT_TOOL_MAP,
++        .serialized_size = trailer_size, .write = trailer_write, .load = trailer_load,
++    };
++    const char *key = "Qwen synthetic visible prefix";
++    check(ds4_kvstore_store_live_prefix_text(&store, engine, session,
++          &frontier, frontier.len, "near-tail", key,
++          DS4_KVSTORE_EXT_RESPONSES_VISIBLE, "responses-prompt", &hooks, err, sizeof(err)), err);
++    logits(session, b, vocab);
++    check(!memcmp(start, b, row_bytes), "save changed logits");
++    check(ds4_tokens_starts_with(ds4_session_tokens(session), &frontier) &&
++          ds4_session_tokens(session)->len == frontier.len, "save changed tokens");
++    save_payload(session, after);
++    equal_payloads(before, after);
++    ds4_tokens extended = {0};
++    ds4_tokens_copy(&extended, &frontier);
++    for (int i = 0; i < append; i++) ds4_tokens_push(&extended, fixture.v[i % fixture.len]);
++    check(!ds4_session_sync(session, &extended, err, sizeof(err)), err);
++    logits(session, a, vocab);
++    int next = ds4_session_argmax(session);
++    check(next >= 0 && !ds4_session_eval(session, next, err, sizeof(err)), err);
++    logits(session, next_row, vocab);
++    save_payload(session, expected);
++    ds4_session_free(session);
++    session = NULL;
++    check(!ds4_session_create(&session, engine, 262144), "restored session");
++    ds4_tokens effective = {0};
++    ds4_kvstore_load_result loaded = {0};
++    char incoming[128];
++    snprintf(incoming, sizeof(incoming), "%s suffix", key);
++    check(ds4_kvstore_try_load_text(&store, engine, session, incoming,
++          &effective, &loaded, &hooks, true) == frontier.len, "visible key load");
++    check((loaded.ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) &&
++          trailer_seen == 1, "visible flag/trailer");
++    check(ds4_tokens_starts_with(&effective, &frontier) &&
++          effective.len > frontier.len, "exact tokens plus suffix");
++    logits(session, b, vocab);
++    check(!memcmp(start, b, row_bytes), "restored frontier logits");
++    check(ds4_tokens_starts_with(ds4_session_tokens(session), &frontier) &&
++          ds4_session_tokens(session)->len == frontier.len, "restored frontier tokens");
++    save_payload(session, loaded_path);
++    equal_payloads(before, loaded_path);
++    check(!ds4_session_sync(session, &extended, err, sizeof(err)), err);
++    logits(session, b, vocab);
++    check(!memcmp(a, b, row_bytes), "same-boundary append logits");
++    check(!ds4_session_eval(session, next, err, sizeof(err)), err);
++    logits(session, b, vocab);
++    check(!memcmp(next_row, b, row_bytes), "next decode logits");
++    save_payload(session, restored);
++    equal_payloads(expected, restored);
++    printf("Qwen checkpoint PASS model=%s prompt=%s prefix=%d history=%d frontier=%d append=%d next=%d vocab=%d\n",
++           argv[1], argv[2], prefix, generated, frontier.len, append, next, vocab);
++    ds4_kvstore_load_result_free(&loaded);
++    ds4_tokens_free(&effective); ds4_tokens_free(&extended); ds4_tokens_free(&frontier);
++    ds4_tokens_free(&fixture); ds4_tokens_free(&prompt);
++    free(start); free(a); free(b); free(next_row);
++    ds4_kvstore_close(&store);
++    ds4_session_free(session);
++    ds4_engine_close(engine);
++    return 0;
++}

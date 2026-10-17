@@ -254,6 +254,11 @@ section. Pushing to the fork has the same SSH problem; the working form is
   branch — that is how the 400 fix was silently dropped once (2026-10-07,
   recorded in `Projects/ds4/progress.md`). Regenerate patches from commits;
   verify with `diff -q`.
+- Don't share one `--kv-disk-dir` between profiles with different rope scaling
+  (`DS4_QWEN4_YARN_FACTOR`). The checkpoint header has no rope field and the
+  `ctx_size` filter is one-directional, so a 393k session can silently load
+  262k-era KV computed in a different rotary frame. Rationale and layout:
+  `docs/KV_PROFILE_ISOLATION.md`.
 - Don't assume the fix branch's `ds4_server.c` is what builds. It is based on
   `0aaea5a` and is a carrier for `build.sh`/`patches/`/docs; the binary is
   upstream-tip + patches. The §Verification step 2 comparison is against the

@@ -95,6 +95,12 @@
 #   0004-responses-vision-block-continuation.patch
 #       Copy the full vision block into the live KV continuation suffix, not
 #       just the pads (tests/test_responses_image_read_repro.py).
+#   0006-vision-embedding-cache-fingerprint-key.patch
+#       Key the vision embedding cache on the pixel fingerprint (SHA-256 of
+#       the decoded width/height/RGB, the same identity the KV tier matches)
+#       instead of exact client bytes, so a client re-encoding the same
+#       pixels turn to turn still hits. 0005 is archived (superseded by
+#       #1206), so this patch takes the next free number.
 #
 # ARCHIVE: patches/archive/0005-…superseded-by-pr-1206.patch — our FIX-1. The
 # visible-suffix gate change is replaced by #1206's two-key design, which also
@@ -185,6 +191,7 @@ apply patches/0001-responses-accept-nonterminal-status.patch
 apply patches/0002-responses-heal-forked-checkpoint.patch
 apply patches/0003-responses-cache-miss-probe.patch
 apply patches/0004-responses-vision-block-continuation.patch
+apply patches/0006-vision-embedding-cache-fingerprint-key.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim
@@ -199,5 +206,5 @@ chmod +x ./ds4-server
 # at startup by macOS code signing ("Invalid Page" inside dyld). See
 # docs/BUILD_PATCHES.md §Swapping the live server.
 codesign --force -s - ./ds4-server
-echo "done: ./ds4-server built from upstream ${FRESH} + 8 upstream PR patches + 4 local patches"
+echo "done: ./ds4-server built from upstream ${FRESH} + 8 upstream PR patches + 5 local patches"
 echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

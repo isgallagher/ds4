@@ -9,7 +9,7 @@ deterministic for a given (upstream commit + patch set).
 This file is the runbook for changing that contract. Read it before editing
 `build.sh`, `patches/`, or swapping the running server.
 
-## The contract today (2026-10-16)
+## The contract today (2026-10-22)
 
 Two groups, applied in this order. Group A is other people's upstream PRs that
 we build on while they wait for merge; group B is our own fixes.
@@ -28,6 +28,7 @@ we build on while they wait for merge; group B is our own fixes.
 | B2 | `patches/0002-responses-heal-forked-checkpoint.patch` | fork-heal in the miss path | ours, **PR antirez/ds4#1194** (draft) |
 | B3 | `patches/0003-responses-cache-miss-probe.patch` | `DS4_CACHE_MISS_DEBUG=1` first-diff window on a miss (diagnostic only) | ours, diagnostic |
 | B4 | `patches/0004-responses-vision-block-continuation.patch` | copy the full vision block into the live KV continuation suffix | ours, no PR |
+| B5 | `patches/0006-vision-embedding-cache-fingerprint-key.patch` | key the vision embedding cache on the pixel fingerprint (SHA-256 of decoded width/height/RGB, the KV tier's identity) instead of exact client bytes, so a client re-encoding the same pixels turn to turn still hits | ours, no PR |
 
 - **Tracker for group A:** upstream issue #1201. Its merge order is
   `1175 → 1169 → 1206 → 1200`, with "#1206 must merge after #1169" (it relies on
@@ -60,7 +61,7 @@ we build on while they wait for merge; group B is our own fixes.
 |---|---|---|
 | Build script | `~/repos/ds4/build.sh` | fetch → patch → build → install → re-sign |
 | Upstream PR patches | `patches/upstream/` | stored verbatim diffs, pinned by the SHAs above |
-| Our patches | `patches/` | `0001`…`0004`, numbered; next is `0005` |
+| Our patches | `patches/` | `0001`…`0004`, `0006` (0005 is archived), numbered; next is `0007` |
 | Archived patch | `patches/archive/` | kept for the record, never applied |
 | Upstream repo | `origin` = `git@github.com:antirez/ds4` (SSH — unusable on this box, see §Fetch) | upstream branch is **`main`**, not `master` |
 | Local fix branch | `fix/responses-replay-status-tolerance` | carries `build.sh` + `patches/` + docs; **not** pushed |
@@ -82,9 +83,8 @@ we build on while they wait for merge; group B is our own fixes.
    3-way fallback needs an index matching HEAD, and the per-step commit makes
    "which patch broke this tree" answerable.
 4. **Order matters and is fixed.** Group A in tracker order, then group B in
-   number order. Keep the numbering: a new local patch is `0005-…` (0005 is
-   archived, so the next free number is `0006`), and its `apply` line goes after
-   the existing ones.
+   number order. Keep the numbering: the next free local patch number is
+   `0007` (0005 is archived), and its `apply` line goes after the existing ones.
 5. **The working tree is never a build input.** The build happens in a throwaway
    `git worktree` at the fetched upstream commit; only `./ds4-server` comes back
    out, and `codesign --force -s -` runs on it (see §Swapping the live server).

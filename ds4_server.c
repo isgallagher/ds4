@@ -3,6 +3,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_image.h"
 #include "ds4_kvstore.h"
 #include "ds4_tp.h"
 #include "rax.h"
@@ -10020,8 +10021,7 @@ struct server_slot {
 #define SERVER_IMAGE_CACHE_BYTES (128u * 1024u * 1024u)
 
 typedef struct {
-    uint8_t *encoded;
-    size_t encoded_len;
+    uint8_t fingerprint[32];
     ds4_vision_embedding embedding;
     size_t data_bytes;
     uint64_t used;
@@ -10035,8 +10035,7 @@ typedef struct {
 
 static void server_image_cache_remove(server_image_cache *cache,
                                       server_image_cache_entry *entry) {
-    cache->bytes -= entry->encoded_len + entry->data_bytes;
-    free(entry->encoded);
+    cache->bytes -= entry->data_bytes;
     ds4_vision_embedding_free(&entry->embedding);
     memset(entry, 0, sizeof(*entry));
 }
@@ -10048,12 +10047,12 @@ static void server_image_cache_clear(server_image_cache *cache) {
 }
 
 static bool server_image_cache_get(server_image_cache *cache,
-                                   const server_image_input *input,
+                                   const uint8_t fingerprint[32],
                                    ds4_vision_embedding *out) {
     for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
         server_image_cache_entry *entry = &cache->entries[i];
-        if (!entry->encoded || entry->encoded_len != input->encoded_len ||
-            memcmp(entry->encoded, input->encoded, input->encoded_len)) continue;
+        if (!entry->used ||
+            memcmp(entry->fingerprint, fingerprint, sizeof(entry->fingerprint))) continue;
         float *data = malloc(entry->data_bytes);
         if (!data) return false;
         memcpy(data, entry->embedding.data, entry->data_bytes);
@@ -10065,50 +10064,45 @@ static bool server_image_cache_get(server_image_cache *cache,
     return false;
 }
 
-/* Cache only successful encodes. Exact byte keys avoid trusting a client hash;
- * callers own a copy, since DeepSeek expands the natural embedding in place. */
+/* Cache only successful encodes. The key is the pixel fingerprint (SHA-256
+ * of the decoded width, height and RGB), not the client's bytes: a client can
+ * re-encode the same pixels turn to turn, and the fingerprint is the same
+ * identity the KV tier matches. No client hash is trusted. Callers own a
+ * copy, since DeepSeek expands the natural embedding in place. */
 static void server_image_cache_put(server_image_cache *cache,
-                                   const server_image_input *input,
+                                   const uint8_t fingerprint[32],
                                    const ds4_vision_embedding *embedding,
                                    uint32_t dim, size_t budget) {
     if (!embedding->data || !dim || !embedding->token_count ||
-        !input->encoded_len ||
         embedding->token_count > budget / sizeof(float) / dim) return;
     size_t bytes = (size_t)embedding->token_count * dim * sizeof(float);
-    if (input->encoded_len > budget - bytes) return;
-    size_t total = input->encoded_len + bytes;
+    if (bytes > budget) return;
     server_image_cache_entry *dest;
     for (;;) {
         dest = &cache->entries[0];
         for (size_t i = 1; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
             if (cache->entries[i].used < dest->used) dest = &cache->entries[i];
         }
-        if (!dest->encoded && cache->bytes <= budget - total) break;
-        if (!dest->encoded) {
+        if (!dest->used && cache->bytes <= budget - bytes) break;
+        if (!dest->used) {
             for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
                 server_image_cache_entry *entry = &cache->entries[i];
-                if (entry->encoded && (!dest->encoded || entry->used < dest->used))
+                if (entry->used && (!dest->used || entry->used < dest->used))
                     dest = entry;
             }
         }
         server_image_cache_remove(cache, dest);
     }
-    uint8_t *encoded = malloc(input->encoded_len);
-    float *data = malloc((size_t)bytes);
-    if (!encoded || !data) {
-        free(encoded);
-        free(data);
-        return;
-    }
-    memcpy(encoded, input->encoded, input->encoded_len);
-    memcpy(data, embedding->data, (size_t)bytes);
+    float *data = malloc(bytes);
+    if (!data) return;
+    memcpy(data, embedding->data, bytes);
     *dest = (server_image_cache_entry) {
-        .encoded = encoded, .encoded_len = input->encoded_len,
-        .embedding = *embedding, .data_bytes = (size_t)bytes,
+        .embedding = *embedding, .data_bytes = bytes,
         .used = ++cache->clock,
     };
+    memcpy(dest->fingerprint, fingerprint, sizeof(dest->fingerprint));
     dest->embedding.data = data;
-    cache->bytes += total;
+    cache->bytes += bytes;
 }
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -10161,21 +10155,33 @@ static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-/* The caller holds inference_mu across cache lookup and encoder execution. */
+/* The caller holds inference_mu across cache lookup and encoder execution.
+ * The cache key is the pixel fingerprint (SHA-256 of the decoded width,
+ * height and RGB) — the same identity the KV tier matches — not the
+ * client's bytes, which can re-encode the same pixels turn to turn.
+ * The pre-decode costs milliseconds; the guarded encode costs seconds. */
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen) {
-    if (server_image_cache_get(&s->image_cache, input, out)) {
+    ds4_image image = {0};
+    if (!ds4_image_decode_memory(&image, input->encoded, input->encoded_len,
+                                err, errlen))
+        return false;
+    if (server_image_cache_get(&s->image_cache, image.fingerprint, out)) {
+        ds4_image_free(&image);
         server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
         return true;
     }
+    ds4_image_free(&image);
     if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
                                          input->encoded_len, out, err, errlen))
         return false;
     /* Row width must match the encoder's allocation: the mmproj projection
      * dim is validated to equal the model's n_embd at load (Qwen3.8 is
-     * 2560-wide, not 4096; a wrong width over-reads the source in put). */
-    server_image_cache_put(&s->image_cache, input, out,
+     * 2560-wide, not 4096; a wrong width over-reads the source in put).
+     * Key on the encode's own fingerprint: same decode as the pre-pass
+     * above, so future lookups hash to this entry. */
+    server_image_cache_put(&s->image_cache, out->fingerprint, out,
                             (uint32_t)ds4_engine_embd_dim(s->engine),
                             SERVER_IMAGE_CACHE_BYTES);
     server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
@@ -22781,48 +22787,53 @@ static void test_responses_tool_image_output(void) {
 
 static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
-    uint8_t key = 1;
+    uint8_t fingerprint[32] = {0};
     float data[2] = {1.25f, -2.5f};
-    server_image_input input = {.encoded = &key, .encoded_len = 1};
     ds4_vision_embedding src = {.data = data, .token_count = 1,
                                .width = 42, .fingerprint = {7}};
     ds4_vision_embedding out = {0};
-    const size_t budget = 2 * (sizeof(data) + 1);
-    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
-    server_image_cache_put(&cache, &input, &src, 2, budget);
-    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    const size_t budget = 2 * sizeof(data);
+    fingerprint[0] = 1;
+    TEST_ASSERT(!server_image_cache_get(&cache, fingerprint, &out));
+    server_image_cache_put(&cache, fingerprint, &src, 2, budget);
+    TEST_ASSERT(server_image_cache_get(&cache, fingerprint, &out));
     TEST_ASSERT(out.data != data && !memcmp(out.data, data, sizeof(data)));
     TEST_ASSERT(out.width == 42 && out.fingerprint[0] == 7);
     out.data[0] = 99;
     ds4_vision_embedding_free(&out);
-    key = 2;
-    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
-    server_image_cache_put(&cache, &input, &src, 2, budget);
-    key = 1;
-    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    fingerprint[0] = 2;
+    TEST_ASSERT(!server_image_cache_get(&cache, fingerprint, &out));
+    server_image_cache_put(&cache, fingerprint, &src, 2, budget);
+    fingerprint[0] = 1;
+    TEST_ASSERT(server_image_cache_get(&cache, fingerprint, &out));
     TEST_ASSERT(out.data[0] == data[0]);
     ds4_vision_embedding_free(&out);
-    key = 3;
-    server_image_cache_put(&cache, &input, &src, 2, budget);
+    fingerprint[0] = 3;
+    server_image_cache_put(&cache, fingerprint, &src, 2, budget);
     TEST_ASSERT(cache.bytes == budget);
-    key = 2;
-    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
-    key = 1;
-    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    fingerprint[0] = 2;
+    TEST_ASSERT(!server_image_cache_get(&cache, fingerprint, &out));
+    fingerprint[0] = 1;
+    TEST_ASSERT(server_image_cache_get(&cache, fingerprint, &out));
     ds4_vision_embedding_free(&out);
     server_image_cache_clear(&cache);
     TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
-    for (key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++)
-        server_image_cache_put(&cache, &input, &src, 2, 4096);
-    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + 1));
-    key = 1;
-    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    for (size_t key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++) {
+        memset(fingerprint, 0, sizeof(fingerprint));
+        fingerprint[0] = (uint8_t)key;
+        server_image_cache_put(&cache, fingerprint, &src, 2, 4096);
+    }
+    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * sizeof(data));
+    fingerprint[0] = 1;
+    TEST_ASSERT(!server_image_cache_get(&cache, fingerprint, &out));
     server_image_cache_clear(&cache);
     src.token_count = UINT32_MAX;
-    server_image_cache_put(&cache, &input, &src, UINT32_MAX, SIZE_MAX);
+    fingerprint[0] = 4;
+    server_image_cache_put(&cache, fingerprint, &src, UINT32_MAX, SIZE_MAX);
     TEST_ASSERT(cache.bytes == 0);
     src.token_count = 1;
-    server_image_cache_put(&cache, &input, &src, 2, sizeof(data));
+    fingerprint[0] = 5;
+    server_image_cache_put(&cache, fingerprint, &src, 2, sizeof(data) / 2);
     TEST_ASSERT(cache.bytes == 0);
 
     /* V4.1 image rows are wider than the older 4096-dimensional encoders. */
@@ -22830,9 +22841,10 @@ static void test_server_image_embedding_cache(void) {
     for (size_t i = 0; i < sizeof(wide) / sizeof(*wide); i++) wide[i] = (float)i;
     src.data = wide;
     src.token_count = 2;
-    server_image_cache_put(&cache, &input, &src, 5120, SERVER_IMAGE_CACHE_BYTES);
-    TEST_ASSERT(cache.bytes == sizeof(wide) + input.encoded_len);
-    const bool found = server_image_cache_get(&cache, &input, &out);
+    fingerprint[0] = 6;
+    server_image_cache_put(&cache, fingerprint, &src, 5120, SERVER_IMAGE_CACHE_BYTES);
+    TEST_ASSERT(cache.bytes == sizeof(wide));
+    const bool found = server_image_cache_get(&cache, fingerprint, &out);
     TEST_ASSERT(found);
     if (found) {
         TEST_ASSERT(out.token_count == 2 && !memcmp(out.data, wide, sizeof(wide)));

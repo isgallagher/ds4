@@ -185,6 +185,38 @@ Four mechanisms, each addressed separately:
 
 **Verification state of the fix set:** built clean on upstream `c97964b`,
 `ds4_test --server` ok, `test-kvstore-near-tail` ok including the new per-session
-policy cases, and the installed binary artifact-confirmed by string probe. **The
-live two-client smoke has never run**, because the server under test is the session
-that would run the test.
+policy cases, and the installed binary artifact-confirmed by string probe.
+
+## 9. Live smoke — two simultaneous sessions (2026-10-31 15:36–16:02) **PASS**
+
+Profile: `start-qwen38-batched-vision.sh` — ctx 262144, `--batched-session 2`,
+mmproj on, KV budget 245760 MiB, `cold_max=262144`. Disk tier was **emptied before
+the run**, so every conversation started from zero; that is the harshest possible
+start and it is why the first turn of each conversation is expensive.
+
+| Observation | Value | Reading |
+|---|---|---|
+| Startup | `batched mode enabled resident_sessions=2 prefill_quantum=2048 mixed_prefill_quantum=128` | residency active |
+| MTP | no *disabled while batching* line | `qwen4_batch_mtp` true on Metal |
+| Memory | planned 89.30 GiB; server: `2 resident sessions … 39.15 GiB, or 27.91 GiB when the model shares one prefill workspace`; measured **RSS 92.4 GiB** | fits the 116 GiB wired limit |
+| Cold turn, 220,200 tok | **269.506 s** (~817 t/s) | unavoidable: empty disk, empty live tier |
+| Cold turn, 112,292 tok | **125.595 s** (~894 t/s) | second conversation, second slot |
+| Every turn after | **0.245 s – 4.224 s** | the shape this whole effort was for |
+| `kv cache stored` | 11 stores, ladder 32,768 → 229,376 incl. **112,292** (the other conversation's frontier) | both conversations checkpointing |
+| `kv cache discarded` | **0** | no payload deleted all run |
+| `forked-payload` / `cancelled-during-*` | 0 / 0 | B7 reasons never fired on a healthy run |
+| `discarding and healing` | **1**, at the second session's first turn, then silent | heal fired once, cost nothing |
+| `live kv cache miss` | one `common=6897`, then six `common=41` | see below |
+
+**What `common=6897` means.** It is the shared prefix of two pi-harness sessions —
+system prompt plus tool scaffolding. The router scored the other slot as reusable,
+matched only that prefix, and missed. It appeared **once** and did not recur, which
+is the pass condition: residency held, and the number is the floor, not a leak.
+The six `common=41` misses are *different, shorter* conversations that genuinely
+share ~41 tokens with whatever was resident — correct behaviour, not the bug.
+
+**Caveats, stated.** The observer was one of the two clients, so the numbers are
+self-observed rather than third-party. The disk tier started empty, so no disk-hit
+evidence was produced — that path is still untested in the field. And the pool is
+sized by **slot count**: a third long conversation beyond `SESSIONS=2` will still
+evict, by design.

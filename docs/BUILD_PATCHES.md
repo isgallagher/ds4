@@ -261,8 +261,17 @@ applies: A1 and A2 with `-3` as documented, A6 and all nine group-B patches **cl
 `ds4-server` builds with zero errors and the same two `-Wpointer-sign` warnings;
 `ds4_test --server` → `ds4 tests: ok`; `test-kvstore-near-tail` → `PASS`;
 `test-qwen-tool-disk-key` links and reports the documented `FAIL (8 failures)`
-(§Known conflicts). Step 4 is still **not** done: the live server was never restarted
-onto a patched binary.
+(§Known conflicts).
+
+**Step 4 passed 2026-10-31 15:36–16:02** on `start-qwen38-batched-vision.sh`
+(ctx 262144, `--batched-session 2`, mmproj, 240 GiB budget, disk tier emptied
+first): `resident_sessions=2`, no MTP-disabled line, RSS 92.4 GiB against the
+116 GiB wired limit, cold turns 269.506 s / 125.595 s, **every subsequent turn
+0.245–4.224 s**, 11 checkpoint stores including both conversations' frontiers,
+`kv cache discarded` **0**, `discarding and healing` once and then silent, and the
+`common=6897` harness-prefix miss appearing once rather than every turn.
+Full table and caveats: `docs/RESPONSES_CACHE_MISS.md` §9. The disk-**hit** path is
+still untested in the field — the store started empty.
 
 A reverse-apply check (`git apply -R --check` on clean `c97964b`) reads `absent` for
 every one of the 17 patches: **none of what we carry has been merged upstream**, so

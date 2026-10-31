@@ -1,0 +1,18 @@
+diff --git a/tests/test_qwen_tool_disk_key.c b/tests/test_qwen_tool_disk_key.c
+index 501370d..deb0b18 100644
+--- a/tests/test_qwen_tool_disk_key.c
++++ b/tests/test_qwen_tool_disk_key.c
+@@ -60,6 +60,13 @@ void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
+ const ds4_tokens *ds4_session_tokens(ds4_session *s) { return &s->tokens; }
+ int ds4_session_pos(ds4_session *s) { return s->tokens.len; }
+ int ds4_session_ctx(ds4_session *s) { (void)s; return 8192; }
++/* A4 (upstream PR #1200) made ds4_kvstore.c call this on the near-tail admission
++ * path, and the symbol lives in ds4.c, which a model-free link of the store does not
++ * pull in. A4 ships the same stub in its own test; A6 needs one too. The near-tail
++ * branch is not what this fixture exercises, so the value only has to be plausible. */
++uint64_t ds4_session_payload_bytes(ds4_session *s) {
++    return 4ull + 4ull * (uint64_t)s->tokens.len + 16ull;
++}
+ bool ds4_session_checkpoint_valid(const ds4_session *s) { return s->tokens.len > 0; }
+ bool ds4_session_has_vision_state(const ds4_session *s) { (void)s; return false; }
+ bool ds4_session_vision_prefix_matches(const ds4_session *s,

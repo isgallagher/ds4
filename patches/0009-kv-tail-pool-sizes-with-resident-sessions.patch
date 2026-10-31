@@ -1,0 +1,109 @@
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index 0c680a1..85d7097 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -949,8 +949,9 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
+ }
+ 
+ /* Supplementary storage: no ordinary entry is removed to
+- * admit a tail. At most two published tails use at most one eighth of budget,
+- * capped at 16 GiB. Existing atomic publication completes before pruning.
++ * admit a tail. Published tails use at most one eighth of budget, capped at
++ * 16 GiB per resident session, and at most two per session. Existing atomic
++ * publication completes before pruning.
+  * A replacement temporarily needs room for both old and new published files. */
+ static bool kv_cache_refresh_checked(ds4_kvstore *kc) {
+     ds4_kvstore_clear(kc);
+@@ -975,8 +976,16 @@ static bool kv_cache_refresh_checked(ds4_kvstore *kc) {
+     return ok;
+ }
+ 
++/* Sessions, not servers: a checkpoint is a frontier for one conversation, so a
++ * box that serves N resident sessions needs room for N of them. Read 0 as 1 so
++ * a store opened without the field keeps the single-session figures exactly. */
++static int kv_cache_session_count(const ds4_kvstore *kc) {
++    return kc->resident_sessions > 0 ? kc->resident_sessions : 1;
++}
++
+ static uint64_t kv_cache_tail_budget(const ds4_kvstore *kc) {
+-    const uint64_t cap = 16ull * 1024ull * 1024ull * 1024ull;
++    const uint64_t per_session = 16ull * 1024ull * 1024ull * 1024ull;
++    const uint64_t cap = per_session * (uint64_t)kv_cache_session_count(kc);
+     const uint64_t share = kc->budget_bytes / 8u;
+     return share < cap ? share : cap;
+ }
+@@ -1005,7 +1014,8 @@ static bool kv_cache_tail_prune(ds4_kvstore *kc, const char *keep) {
+         count++;
+     }
+     if (!seen_keep) return false;
+-    while (count > 2 || bytes > kv_cache_tail_budget(kc)) {
++    while (count > 2 * kv_cache_session_count(kc) ||
++           bytes > kv_cache_tail_budget(kc)) {
+         int victim = -1;
+         for (int i = 0; i < kc->len; i++) {
+             ds4_kvstore_entry *e = &kc->entry[i];
+diff --git a/ds4_kvstore.h b/ds4_kvstore.h
+index 15d33a6..d2c0d85 100644
+--- a/ds4_kvstore.h
++++ b/ds4_kvstore.h
+@@ -69,6 +69,11 @@ typedef struct {
+     bool enabled;
+     char *dir;
+     uint64_t budget_bytes;
++    /* Resident sessions the host server keeps.  The supplementary (near-tail)
++     * pool is sized per session, because every session's frontier has to
++     * survive its own turn, not just the server's.  0 is read as 1, so a store
++     * opened without this set behaves exactly as a single-session box. */
++    int resident_sessions;
+     bool reject_different_quant;
+     ds4_kvstore_options opt;
+     int continued_last_store_tokens;
+diff --git a/ds4_server.c b/ds4_server.c
+index a0fa16c..f345112 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -16659,6 +16659,10 @@ int main(int argc, char **argv) {
+     if (cfg.kv_disk_dir) {
+         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
++        /* The supplementary checkpoint pool is sized per resident session, so it
++         * needs the slot count the server actually allocated, not a value the
++         * operator has to keep in sync with --batched-session by hand. */
++        s.kv.resident_sessions = slot_count;
+     }
+     if (s.disable_exact_dsml_tool_replay) {
+         server_log(DS4_LOG_DEFAULT,
+diff --git a/tests/test_kvstore_near_tail.c b/tests/test_kvstore_near_tail.c
+index 6515ebe..a52c513 100644
+--- a/tests/test_kvstore_near_tail.c
++++ b/tests/test_kvstore_near_tail.c
+@@ -228,7 +228,7 @@ static void limits(ds4_kvstore *k){
+     for(int i=0;i<k->len;i++)if(k->entry[i].reason==DS4_KVSTORE_REASON_NEAR_TAIL){
+         c++;
+         n+=k->entry[i].file_size;
+-    }assert(c<=2&&n<=kv_cache_tail_budget(k));
++    }assert(c<=2*kv_cache_session_count(k)&&n<=kv_cache_tail_budget(k));
+ }
+ static unsigned char *file_bytes(const char *path,size_t *n){
+     struct stat st;
+@@ -460,6 +460,20 @@ int main(void){
+     for(int i=0;i<k.len;i++)assert(!unlink(k.entry[i].path));
+     ds4_kvstore_close(&k);
+     assert(!rmdir(fixture_dir));
++    /* Policy, no filesystem: the supplementary pool scales with resident
++     * sessions, and a box that never sets the field keeps the single-session
++     * figures exactly. At 240 GiB the eighth-of-budget share binds from three
++     * sessions up, which is the point: the share, not the per-session cap,
++     * is what an operator buys with --kv-disk-space-mb. */
++    const uint64_t gib=1024ull*1024ull*1024ull;
++    ds4_kvstore s1={0},s2={0},s3={0},s8={0};
++    s1.budget_bytes=s2.budget_bytes=s3.budget_bytes=s8.budget_bytes=240ull*gib;
++    s2.resident_sessions=2;s3.resident_sessions=3;s8.resident_sessions=8;
++    assert(kv_cache_session_count(&s1)==1);
++    assert(kv_cache_tail_budget(&s1)==16ull*gib);   /* min(240/8,16*1) */
++    assert(kv_cache_tail_budget(&s2)==30ull*gib);   /* min(240/8,16*2) */
++    assert(kv_cache_tail_budget(&s3)==30ull*gib);   /* share binds */
++    assert(kv_cache_tail_budget(&s8)==30ull*gib);
+     puts("KV supplementary checkpoint fixture PASS (mock payload; no model oracle)");
+     return 0;
+ }

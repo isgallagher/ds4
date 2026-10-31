@@ -84,10 +84,18 @@ lives in a shell script is not a guard.
 
 ## 4. Recommended layout
 
-| profile | flags | directory |
-|---------|-------|-----------|
-| 262k + vision (daily driver today) | ctx 262144, no YaRN | `~/.ds4/kv-cache-262k` |
-| 393k long-context (max thinking) | ctx 393216, `DS4_QWEN4_YARN_FACTOR=1.5` | `~/.ds4/kv-cache-393k` |
+| profile | flags | directory | launcher |
+|---------|-------|-----------|----------|
+| 262k + vision (daily driver today) | ctx 262144, no YaRN | `~/.ds4/kv-cache-262k` | `start-qwen38-262k-vision.sh` |
+| 262k + vision, N resident sessions | ctx 262144, no YaRN, `--batched-session N` | same as above, **deliberately** — identical rope frame, so checkpoints carry over instead of being rebuilt | `start-qwen38-batched-vision.sh` |
+| 393k long-context (max thinking) | ctx 393216, `DS4_QWEN4_YARN_FACTOR=1.5` | `~/.ds4/kv-cache-393k` | `start-qwen38-longctx.sh` |
+| 393k, N resident sessions | ctx 393216, YaRN 1.5, `--batched-session N` | must **never** share a directory with a native-frame profile | `start-qwen38-batched.sh` |
+
+> [!warning] The directory names above are the recommendation, not the field state
+> Both the 262k vision profile and the 393k YaRN profile are launched today against the **same** `~/.ds4/kv-cache`, which is exactly the mixing §1–§3 warn about. The batched-vision launcher shares it on purpose (same frame); the YaRN launcher warns on every start and refuses a YaRN factor at native context. The rename below is still the correct fix and is still not done.
+
+> [!tip] Watch for a context/cold-path mismatch
+> The live 2026-10-31 invocation carried `--kv-cache-cold-max-tokens 393216` against `--ctx 262144` — a leftover from the YaRN profile that asks the cold path for checkpoints wider than the context can hold. The batched launchers derive the value from `CTX` so it cannot drift.
 
 - Rename the current store to `~/.ds4/kv-cache-262k` **while the server is
   stopped** — the live store holds those paths. Do not delete it: it holds
@@ -95,9 +103,19 @@ lives in a shell script is not a guard.
 - The store directory is created recursively when missing (`kv_mkdir_p`
   `ds4_kvstore.c:356`, called at 628), so the 393k profile needs no prep.
 - Budgets are per store instance (`ds4_kvstore.c:637`), so each profile gets its
-  own `--kv-disk-space-mb` **and** its own near-tail allowance
-  (`kv_cache_tail_budget` = `min(budget/8, 16 GiB)`, `ds4_kvstore.c:978`).
-- The near-tail prune is global and keeps 2 entries with no conversation check
+  own `--kv-disk-space-mb` **and** its own near-tail allowance.
+  `kv_cache_tail_budget` = `min(budget/8, 16 GiB × resident sessions)` — per
+  **session**, not per server, since our patch `0009`: a
+  checkpoint is a frontier for one conversation, so N resident sessions need room
+  for N of them. `resident_sessions` is set from the server's slot count, so the
+  pool cannot drift from `--batched-session`, and `0` is read as `1` so a
+  single-session box keeps the original figures exactly. Arithmetic that matters:
+  a 393k checkpoint is ~12.3 GiB (§5), so at 120 GiB the pool is
+  `min(15, 32) = 15 GiB` and holds **one**; at 240 GiB with two sessions it is
+  `min(30, 32) = 30 GiB` and holds **two**. The eighth-of-budget share, not the
+  per-session cap, is what an operator buys with disk budget.
+- The near-tail prune is global and keeps `2 × resident sessions` entries with no
+  conversation check
   (`kv_cache_tail_prune`, `ds4_kvstore.c:994-1029`). Separate directories stop
   the 393k profile's ~12 GiB checkpoints from evicting the 262k profile's small
   ones. Measured in the field on 2026-10-16: one session's 25,527-token store

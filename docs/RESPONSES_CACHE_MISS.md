@@ -139,3 +139,52 @@ So the miss is the **first *text* turn after a run of *tool-call* turns**, and `
 - **The agent that reasons about the model's chat-template/think markers will truncate its own turn** if it composes those literal sequences in reasoning or prose. Refer to them abstractly ("the thinking open/close markers", "the assistant role token") or, if a value is needed, as base64 — never spell the full marker sequences in a tool call, file write, or reasoning. This doc deliberately does not.
 - **The running server is someone's live session.** Build freely; **do not restart it** without the operator's go.
 - **Disk cache is ~full** (116/120 GiB). A "stale snapshot" load is normal-but-expensive; don't chase disk-full as the bug — the bug is the token mismatch that *forces* the disk fallback.
+
+## 8. Multi-client residency (2026-10-29) — same symptom, different cause
+
+The sections above are about **one** client whose history forks. The 2026-10-29
+capture is the same log signature — `live kv cache miss … reason=token-mismatch`
+with a tiny `common` — from a different mechanism: **two clients, one resident
+session.**
+
+| Evidence (2026-10-29, single-session server) | Value |
+|---|---|
+| Shared prefix found on switch | `common=6897` — the system + tool prefix only |
+| Re-prefill after a discarded checkpoint | 307,066 tokens in **436.664 s** |
+| Same, other conversation | 140,796 tokens in **182.213 s** |
+| Same switch class with a warm cache | 2,494 tokens in **4.459 s** |
+| Decode at 334k context | 33–37 t/s — the math was never the problem |
+
+Four mechanisms, each addressed separately:
+
+1. **One resident session evicts the peer's live KV on every turn.** Fix:
+   `--batched-session N`. The router scores a slot by the prefix it can reuse and
+   makes an active peer slot the last eviction victim.
+2. **The fork guard (B2) discarded valid `token-text` checkpoints.** A
+   `token-text` payload is byte-verified by the loader, so comparing token ids
+   produced false positives — it threw away the long spliced checkpoint and kept a
+   short fresh one. Fix: `0007` narrows the guard to visible-keyed checkpoints,
+   which genuinely can hide a fork because they omit hidden reasoning.
+3. **The near-tail pool could not hold two frontiers.** It is capped
+   independently of the disk budget at `min(budget/8, 16 GiB)` and holds two
+   entries; a 393k checkpoint is ~12.3 GiB, so no budget made room for two
+   clients. Fix: `0009` sizes it per resident session, and `0007` writes the
+   departing frontier as an `evict` **anchor**, which the tail prune never touches.
+4. **A cancelled prefill deleted the payload it had loaded, and logged as
+   corruption.** Fix: `0008` gives the three discard sites distinct reasons —
+   `forked-payload`, `*-sync-failed`, `cancelled-during-*`.
+
+> [!warning] The guardrail in §7 was violated in the session that wrote this section
+> Four turns were truncated by composing the chat-template marker literals while
+> reasoning about B2's key material — exactly what §7 warns about, and the warning
+> was already in this file. The fix is not a stronger warning: those characters
+> must not appear in agent output **or reasoning** at all, because reasoning
+> streams into the transcript. Files that carry them as literals get touched via
+> computed indices or existing constants, and inspection returns line numbers,
+> lengths and counts instead of bytes.
+
+**Verification state of the fix set:** built clean on upstream `c97964b`,
+`ds4_test --server` ok, `test-kvstore-near-tail` ok including the new per-session
+policy cases, and the installed binary artifact-confirmed by string probe. **The
+live two-client smoke has never run**, because the server under test is the session
+that would run the test.

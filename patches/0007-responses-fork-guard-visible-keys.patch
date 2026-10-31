@@ -1,0 +1,160 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index f2b63be..6fe4e45 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -11631,11 +11631,17 @@ static void kv_cache_maybe_store_prompt_tail(server *s, server_slot *slot,
+                                          KV_EXT_RESPONSES_VISIBLE, "responses-prompt");
+ }
+ 
+-static void kv_cache_store_current(server *s, server_slot *slot,
+-                                   const char *reason) {
+-    if (!s || !slot) return;
++/* Select the disk key for the slot's current live checkpoint.  Returns the
++ * visible transcript when one exists and covers exactly the current token
++ * count, reporting its ext flag and label through the out params.  Returns
++ * NULL when there is none, which means the store keys the payload by its own
++ * rendered text.  Callers own the returned string. */
++static char *kv_cache_visible_checkpoint(server *s, server_slot *slot,
++                                         uint8_t *ext_out,
++                                         const char **key_out) {
++    if (!s || !slot) return NULL;
+     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+-    if (!tokens) return;
++    if (!tokens) return NULL;
+ 
+     char *visible_text = NULL;
+     uint8_t visible_ext = 0;
+@@ -11660,6 +11666,37 @@ static void kv_cache_store_current(server *s, server_slot *slot,
+         visible_key = "thinking-visible";
+     }
+     pthread_mutex_unlock(&s->tool_mu);
++    if (!visible_text) return NULL;
++    if (ext_out) *ext_out = visible_ext;
++    if (key_out) *key_out = visible_key;
++    return visible_text;
++}
++
++/* True when the checkpoint kv_cache_store_current() would write is keyed by a
++ * visible transcript instead of by its own rendered text.  Only a visible key
++ * can hide a divergence between the hidden KV history and the client's
++ * canonical re-render, because it leaves that reasoning out by design.  A
++ * token-text key is self-verifying: ds4_kvstore_try_load_text() compares the
++ * stored bytes against the incoming prompt, so a payload under that key is
++ * either a byte prefix of what the client will resend or it does not load. */
++static bool kv_current_checkpoint_is_visible_keyed(server *s,
++                                                   server_slot *slot) {
++    char *visible = kv_cache_visible_checkpoint(s, slot, NULL, NULL);
++    const bool keyed = visible != NULL;
++    free(visible);
++    return keyed;
++}
++
++static void kv_cache_store_current(server *s, server_slot *slot,
++                                   const char *reason) {
++    if (!s || !slot) return;
++    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
++    if (!tokens) return;
++
++    uint8_t visible_ext = 0;
++    const char *visible_key = NULL;
++    char *visible_text = kv_cache_visible_checkpoint(s, slot, &visible_ext,
++                                                     &visible_key);
+ 
+     /* A visible live checkpoint can contain hidden reasoning that the client
+      * intentionally does not replay.  For disk recovery after a session switch,
+@@ -14121,31 +14158,42 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+     }
+     if (cached == 0) slot->continued_last_store_tokens = 0;
+     /* Responses fork heal: a token-mismatch miss with a nonempty shared
+-     * prefix means the client's canonical re-render forked from the live
+-     * checkpoint mid-history (a compaction, abort, or history edit rewrote
+-     * the transcript). The forked live checkpoint, and any disk payload
+-     * keyed to it, diverge from what the client will resend. Persisting or
+-     * loading them re-seeds the fork on every turn: the next compare misses
+-     * at the same frozen point and the fallback re-runs. On that shape,
+-     * skip the evict-store below, reject a forked disk payload, and heal by
+-     * full-syncing the client's canonical prompt so the checkpoint becomes
+-     * the client's re-render and the next turn continues in lockstep. */
++     * prefix means the live checkpoint and the client's canonical re-render no
++     * longer agree.  Two shapes reach this line.  One client rewrote its own
++     * history (a compaction, abort, or edit), and the forked checkpoint would
++     * re-seed the same frozen compare point on every later turn.  A second
++     * client arrived while one slot served both conversations, and the shared
++     * prefix is nothing but the common system and tool preamble - the other
++     * conversation's checkpoint is still exactly right for its own owner.
++     * The two shapes are indistinguishable from token counts alone, so the
++     * decision is taken on the disk key instead, which does separate them: a
++     * visible-transcript key can hide the divergence, a token-text key proves
++     * the bytes by construction.  Guard the visible kind, keep the token-text
++     * kind usable, and heal only what is actually forked. */
+     const bool responses_fork_heal =
+         responses_protocol && !multimodal && old_pos > 0 &&
+         common > 0 && common < old_pos && common < j->req.prompt.len;
++    const bool heal_persists_live =
++        responses_fork_heal && !kv_current_checkpoint_is_visible_keyed(s, slot);
+     if (cached == 0 && responses_fork_heal) {
+         server_log(DS4_LOG_KVCACHE,
+-                   "ds4-server: responses live checkpoint forks from client re-render RESPPROTO live=%d prompt=%d common=%d; healing from canonical prompt (skip forked evict-store, reject forked disk load)",
+-                   old_pos, j->req.prompt.len, common);
++                   "ds4-server: responses live checkpoint forks from client re-render RESPPROTO live=%d prompt=%d common=%d; healing from canonical prompt (%s)",
++                   old_pos, j->req.prompt.len, common,
++                   heal_persists_live ? "token-text key: persist live prefix, accept byte-verified disk payload"
++                                      : "visible key: skip forked evict-store, reject forked disk load");
+     }
+     if (!multimodal && s->kv.enabled && cached == 0 &&
+-        old_pos >= s->kv.opt.min_tokens && !responses_fork_heal) {
++        old_pos >= s->kv.opt.min_tokens &&
++        (!responses_fork_heal || heal_persists_live)) {
+         /* Loading a disk snapshot replaces the live Metal session.  Persist the
+          * current checkpoint first, otherwise a cache hit for an older prefix
+-         * would silently discard the newer conversation state.  Skipped on a
+-         * Responses fork heal: the checkpoint about to be persisted forks from
+-         * the client's re-render and would be re-loaded (and re-forked) on
+-         * every subsequent turn. */
++         * would silently discard the newer conversation state.  Skipped only
++         * when the checkpoint would be keyed by a visible transcript: that key
++         * covers the fork the heal is removing, and re-loading it would
++         * re-seed the fork on every subsequent turn.  A token-text checkpoint
++         * describes its own bytes, so the next owner of this conversation
++         * matches it honestly and the departing client keeps a frontier
++         * instead of rebuilding from zero. */
+         kv_cache_store_current(s, slot, "evict");
+     }
+     if (!multimodal && cached == 0) {
+@@ -14153,18 +14201,29 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+                                         &disk_cache_path,
+                                         &disk_cache_ext_flags);
+         if (disk_cached > 0) {
+-            /* Forked disk-load guard: the payload was found by a text
+-             * prefix, but its tokens are from the era it was saved. On a
+-             * Responses fork heal that era forks from the client's current
+-             * re-render (raw generated bytes, or a re-seeded forked
+-             * checkpoint). Extending it would carry the fork forward: the
++            /* Forked disk-load guard, visible keys only: the payload was
++             * found by a text prefix, and a visible-keyed payload can carry
++             * the era it was saved in, because hidden reasoning is not in its
++             * key. Extending that payload would carry the fork forward: the
+              * next turn misses at the same frozen point, re-loads the same
+              * payload, and the desync persists. Verify the loaded tokens are
+              * still a lockstep prefix of the client's canonical prompt; on a
+              * fork, discard the payload and heal the checkpoint from the
+              * client's prompt instead (prompt_for_sync stays the canonical
+-             * full prompt). */
+-            if (responses_fork_heal) {
++             * full prompt).
++             * A token-text payload is not guarded. Its stored text was just
++             * proven to be a byte prefix of this prompt, and the loader
++             * rebuilds the prompt from the stored token history plus the
++             * tokenized suffix, so ids legitimately differ wherever an
++             * earlier splice set a boundary. Comparing ids against a fresh
++             * tokenization of the whole prompt therefore rejects long spliced
++             * checkpoints and accepts only short freshly tokenized ones -
++             * the opposite of what recovery wants, and on a multi-session
++             * server it repeats on every client switch, because no
++             * conversation keeps the slot long enough to converge. */
++            if (responses_fork_heal &&
++                (disk_cache_ext_flags & (KV_EXT_RESPONSES_VISIBLE |
++                                         KV_EXT_THINKING_VISIBLE))) {
+                 pthread_mutex_lock(&s->inference_mu);
+                 const int loaded_common =
+                     ds4_session_common_prefix(slot->session, &j->req.prompt);

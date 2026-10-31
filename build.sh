@@ -101,6 +101,64 @@
 #       instead of exact client bytes, so a client re-encoding the same
 #       pixels turn to turn still hits. 0005 is archived (superseded by
 #       #1206), so this patch takes the next free number.
+#   0007-responses-fork-guard-visible-keys.patch
+#       Narrow the 0002 fork guard to visible-keyed checkpoints, on both the
+#       load side and the store side. A token-text payload is byte-verified
+#       against the incoming prompt by the loader (ds4_kvstore.c
+#       try_load_text), so the token-id compare there is not evidence of a
+#       fork: the loader rebuilds the prompt from the stored token history
+#       plus the tokenized suffix, so ids differ at every earlier splice
+#       boundary while the bytes are the same history. The compare therefore
+#       discarded long spliced checkpoints and accepted short freshly
+#       tokenized ones — inverted. On a single-slot server every client
+#       switch took that path, so the heal never converged. Store side: the
+#       departing checkpoint is persisted when its key is token-text, and
+#       skipped only when a visible key would hide the fork. Measured need
+#       (2026-10-29, this box, two pi clients, one resident session):
+#       19:10:15 discarded a 294912-token payload (loaded=294912
+#       common=243669) and re-prefilled 307066 tokens in 436.664 s, against
+#       4.459 s for the same class of switch at 19:19:23. Multi-client
+#       serving itself is --batched-session N (docs/SERVER.md:58, and the
+#       reuse-aware router job_slot_score); this patch keeps the disk tier
+#       usable on the way there and for N+1 clients.
+#   0008-kv-discard-reason-per-decision-site.patch
+#       kv_cache_discard_failed_disk_entry -> kv_cache_discard_disk_entry with
+#       a reason argument, so the three decision sites stop sharing one label.
+#       "forked-payload" is a deliberate policy discard of a checkpoint that is
+#       valid for its own owner; "cold-prefix-sync-failed" / "prompt-sync-
+#       failed" are engine errors; "cancelled-during-*" is a client that
+#       stopped reading. Measured confusion: 2026-10-29 19:19:22 printed
+#       reason=prefill-failed for a cancelled 140796-token prefill whose only
+#       effect was deleting the payload it had loaded — read as corruption.
+#       Diagnostic only: same unlink, same session invalidation.
+#   0009-kv-tail-pool-sizes-with-resident-sessions.patch
+#       Size the near-tail (supplementary) pool by resident sessions instead
+#       of by server: cap 16 GiB -> 16 GiB x sessions, entry limit 2 -> 2 x
+#       sessions, driven by a new ds4_kvstore.resident_sessions set from
+#       slot_count after kv_cache_open. 0 is read as 1, so a single-session
+#       box is byte-for-byte the old policy and tests/test_kvstore_near_tail
+#       still passes unchanged. Measured need: a 393k checkpoint is ~12.3 GiB
+#       (KV_PROFILE_ISOLATION.md §5), so the old 16 GiB ceiling could never
+#       hold two clients' frontiers at any --kv-disk-space-mb — 240 GiB still
+#       yields min(30, 16) = 16 GiB. Deviation from "local patches touch
+#       ds4_server.c only": the sizing lives in ds4_kvstore.c, so the knob
+#       must live there too (4 files, 38 insertions). Extends
+#       tests/test_kvstore_near_tail with the policy cases (sessions unset =
+#       16 GiB at a 240 GiB budget, 2 sessions = 30 GiB, 3 and 8 sessions =
+#       30 GiB because the eighth-of-budget share binds), so the new branch is
+#       proven rather than asserted in prose.
+#   0010-kvstore-test-stub-payload-bytes.patch
+#       A6's model-free test (tests/test_qwen_tool_disk_key.c) does not link once
+#       A4 is in the tree: A4 made ds4_kvstore.c call ds4_session_payload_bytes,
+#       which lives in ds4.c, and that target links only the store plus rax.
+#       A4 ships the same stub in its own test; A6 needs one too. Diagnostic value
+#       is nil and the near-tail branch is not what that fixture exercises, so the
+#       value only has to be plausible. Found 2026-10-31: verification step 3 ran
+#       only ds4_test --server, so this target had never been run in our contract.
+#       NOTE: with the stub it links and then fails 8 rows, because A2 (PR #1169)
+#       and A6 (PR #1212) changed the same key-and-suffix rule from opposite sides
+#       and upstream never ran them together. That red is documented in
+#       docs/BUILD_PATCHES.md and is NOT this patch's concern.
 #
 # ARCHIVE: patches/archive/0005-…superseded-by-pr-1206.patch — our FIX-1. The
 # visible-suffix gate change is replaced by #1206's two-key design, which also
@@ -192,6 +250,10 @@ apply patches/0002-responses-heal-forked-checkpoint.patch
 apply patches/0003-responses-cache-miss-probe.patch
 apply patches/0004-responses-vision-block-continuation.patch
 apply patches/0006-vision-embedding-cache-fingerprint-key.patch
+apply patches/0007-responses-fork-guard-visible-keys.patch
+apply patches/0008-kv-discard-reason-per-decision-site.patch
+apply patches/0009-kv-tail-pool-sizes-with-resident-sessions.patch
+apply patches/0010-kvstore-test-stub-payload-bytes.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim
@@ -206,5 +268,5 @@ chmod +x ./ds4-server
 # at startup by macOS code signing ("Invalid Page" inside dyld). See
 # docs/BUILD_PATCHES.md §Swapping the live server.
 codesign --force -s - ./ds4-server
-echo "done: ./ds4-server built from upstream ${FRESH} + 8 upstream PR patches + 5 local patches"
+echo "done: ./ds4-server built from upstream ${FRESH} + 8 upstream PR patches + 9 local patches"
 echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

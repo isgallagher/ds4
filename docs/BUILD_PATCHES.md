@@ -21,7 +21,7 @@ we build on while they wait for merge; group B is our own fixes.
 | A3 | `patches/upstream/pr1206-integrated.patch` | preserve the Qwen Responses live frontier when the client replays an emitted final-answer reasoning summary (and when it does not) | PR #1206 @ `a08bce5`, open — **stored integrated**, see §Why A3 is not the raw PR |
 | A4 | `patches/upstream/pr1200.patch` | save eligible completed text-only Qwen Responses prompts as a `near-tail` checkpoint before generation | PR #1200 @ `d18057e`, open |
 | A5 | `patches/upstream/pr1221.patch` | let the memory-text tier survive images (fixes #1214) | PR #1221 @ `2b720e8`, open |
-| A6 | `patches/upstream/pr1212.patch` | fix the Qwen Chat tool-turn disk checkpoint key for reasoning-echo histories (fixes #1211) — the turn persisted a reasoning-free alias, so the next return could not match it | PR #1212 @ `a05decc`, open |
+| A6 | `patches/upstream/pr1212.patch` | fix the Qwen Chat tool-turn disk checkpoint key for reasoning-echo histories (fixes #1211) — the turn persisted a reasoning-free alias, so the next return could not match it | PR #1212 @ `a05decc`, open. **Regenerated 2026-10-31 against upstream `c97964b`** — context only: upstream added lines at the same `.gitignore` spot and extended the `clean:` block, so the old file left markers; the new one applies clean after A1–A4 |
 | A7 | `patches/upstream/pr1216.patch` | pick the **longest** text-prefix disk checkpoint in one pass, and stop re-hashing the prompt per candidate | PR #1216 @ `402c80b`, open |
 | A8 | `patches/upstream/pr1197.patch` | accept WebP images on macOS through ImageIO (a pasted WebP used to answer a generic 400) | PR #1197 @ `cea545e`, open |
 | B1 | `patches/0001-responses-accept-nonterminal-status.patch` | accept non-terminal item status + drop unknown item types on Responses replay (the "400 API" fix) | ours, no PR |
@@ -29,6 +29,10 @@ we build on while they wait for merge; group B is our own fixes.
 | B3 | `patches/0003-responses-cache-miss-probe.patch` | `DS4_CACHE_MISS_DEBUG=1` first-diff window on a miss (diagnostic only) | ours, diagnostic |
 | B4 | `patches/0004-responses-vision-block-continuation.patch` | copy the full vision block into the live KV continuation suffix | ours, no PR |
 | B5 | `patches/0006-vision-embedding-cache-fingerprint-key.patch` | key the vision embedding cache on the pixel fingerprint (SHA-256 of decoded width/height/RGB, the KV tier's identity) instead of exact client bytes, so a client re-encoding the same pixels turn to turn still hits | ours, no PR |
+| B6 | `patches/0007-responses-fork-guard-visible-keys.patch` | narrow the B2 fork guard to **visible-keyed** checkpoints, load side and store side: a `token-text` payload is byte-verified against the incoming prompt by the loader, so the token-id compare produced false positives — it discarded long spliced checkpoints and kept short fresh ones. Measured need: 2026-10-29, two clients on one resident session, 294,912-token payload discarded → 436.664 s re-prefill vs 4.459 s for the same switch class | ours, no PR (supersedes nothing; B2 stays the visible-key safety net) |
+| B7 | `patches/0008-kv-discard-reason-per-decision-site.patch` | `kv_cache_discard_disk_entry(s, slot, path, reason)` — the three discard sites get distinct reasons (`forked-payload`, `cold-prefix-sync-failed`, `prompt-sync-failed`, `cancelled-during-*`) instead of one `prefill-failed`. Diagnostic only: same unlink, same invalidation | ours, no PR |
+| B8 | `patches/0009-kv-tail-pool-sizes-with-resident-sessions.patch` | near-tail pool sized per resident session: cap 16 GiB → 16 GiB × sessions, entry limit 2 → 2 × sessions, from `ds4_kvstore.resident_sessions` set to `slot_count`. `0` reads as `1`, so single-session behaviour is unchanged and A4's test passes untouched. Extends `tests/test_kvstore_near_tail` with the policy cases (unset → 16 GiB at a 240 GiB budget, 2 sessions → 30 GiB, 3 and 8 → 30 GiB, share binds). **Touches 4 files** (`ds4_kvstore.h/.c`, `ds4_server.c`, the test) — the deviation from "local patches touch `ds4_server.c` only" is because the sizing lives in the store | ours, no PR |
+| B9 | `patches/0010-kvstore-test-stub-payload-bytes.patch` | stub `ds4_session_payload_bytes` in A6's model-free test so it links once A4 is in the tree (A4 made the store call it; the symbol lives in `ds4.c`, which that target does not link). A4 ships the same stub in its own test | ours, no PR |
 
 - **Tracker for group A:** upstream issue #1201. Its merge order is
   `1175 → 1169 → 1206 → 1200`, with "#1206 must merge after #1169" (it relies on
@@ -40,6 +44,37 @@ we build on while they wait for merge; group B is our own fixes.
   - **#1170** — checkpoint selection + eviction, 25 KB. Overlaps A7 on the lookup
     we needed, conflicts with B2 at the disk guard (2 regions measured), and
     interacts with #1200. Revisit only if A7 proves insufficient.
+    **Re-surveyed 2026-10-29 against the tree with B6–B8: 4 conflict regions**
+    (`ds4_kvstore.c` store-admission + the text-prefix lookup, `ds4_server.c`
+    `kv_cache_store_current` signature + the evict call site). Its lookup helper
+    is a weaker copy of A7's, so that region resolves by deleting theirs. **Scope
+    check first, though:** `protect_text` is *this request's* prompt, so #1170
+    fixes the self-evict case its own message names ("the outgoing store evicted
+    the snapshot the same request loads right after") and does **not** protect a
+    *peer's* checkpoint from a store on another slot — which is the 2026-10-29
+    19:13:55 loss. B8 plus the 240 GiB budget address that by sizing; #1170 stays
+    out until a cross-session protection is added to it.
+
+## Known conflicts inside our own contract
+
+These are not our bugs. They are upstream PRs we carry that changed the same rule
+from opposite directions, and upstream never ran them together because #1201's
+tracker order does not contain them both.
+
+- **A2 (#1169) × A6 (#1212) — `test-qwen-tool-disk-key` fails 8 of 9 rows.**
+  Measured 2026-10-31 on `c97964b` and on `ee7e840` alike, with only A2 and A6
+  applied, so no B patch is involved. The stored payload is exactly **10 bytes
+  longer** than the fixture expects, every extra byte at the tail, and the visible-key
+  flag condition holds in all 9 rows. A2's stated purpose is changing precisely that
+  committed-suffix rule for Qwen tool-visible keys, so A6's fixture predates it.
+  **Do not "fix" this by editing the fixture.** The expectation belongs to #1212's
+  author, and a green test I wrote would hide a real disagreement between two
+  upstream authors. Re-check when either PR merges upstream, or when #1212's author
+  rebases onto #1169.
+- **A4 (#1200) × A6 (#1212) — link error, fixed by B9.** A4 added a
+  `ds4_session_payload_bytes` call on the store's near-tail admission path; A6's
+  standalone test links the store without `ds4.c`. B9 is the same stub A4 ships in
+  its own test.
   - **#1168** — speculative-drafting backoff, 70 KB, 2 conflict regions. We run
     `--mtp`; judge it on our own `--mtp-timing` data first.
   - **#1205** — the GLM-5.3-only variant of our option C. Not applicable to Qwen.
@@ -61,7 +96,7 @@ we build on while they wait for merge; group B is our own fixes.
 |---|---|---|
 | Build script | `~/repos/ds4/build.sh` | fetch → patch → build → install → re-sign |
 | Upstream PR patches | `patches/upstream/` | stored verbatim diffs, pinned by the SHAs above |
-| Our patches | `patches/` | `0001`…`0004`, `0006` (0005 is archived), numbered; next is `0007` |
+| Our patches | `patches/` | `0001`…`0004`, `0006`…`0010` (0005 is archived), numbered; next is `0011` |
 | Archived patch | `patches/archive/` | kept for the record, never applied |
 | Upstream repo | `origin` = `git@github.com:antirez/ds4` (SSH — unusable on this box, see §Fetch) | upstream branch is **`main`**, not `master` |
 | Local fix branch | `fix/responses-replay-status-tolerance` | carries `build.sh` + `patches/` + docs; **not** pushed |
@@ -84,7 +119,7 @@ we build on while they wait for merge; group B is our own fixes.
    "which patch broke this tree" answerable.
 4. **Order matters and is fixed.** Group A in tracker order, then group B in
    number order. Keep the numbering: the next free local patch number is
-   `0007` (0005 is archived), and its `apply` line goes after the existing ones.
+   `0011` (0005 is archived), and its `apply` line goes after the existing ones.
 5. **The working tree is never a build input.** The build happens in a throwaway
    `git worktree` at the fetched upstream commit; only `./ds4-server` comes back
    out, and `codesign --force -s -` runs on it (see §Swapping the live server).
@@ -202,10 +237,46 @@ Run in this order; a change is "done" when all four pass:
    → `ds4 tests: ok`. Expected noise: `thinking not closed, ignoring incomplete
    Qwen tool calls in reasoning` (a synthetic 1-token case) and two
    `-Wpointer-sign` warnings at the B3 probe's base64 call sites.
+
+   **Also run both model-free targets our patches add** — `ds4_test --server` does
+   not cover them, and that gap hid a broken link for the whole life of A6:
+   ```sh
+   make CC=/usr/bin/clang test-kvstore-near-tail     # A4's store regression
+   make CC=/usr/bin/clang test-qwen-tool-disk-key    # A6's key regression
+   ```
+   `test-kvstore-near-tail` → `PASS`. **`test-qwen-tool-disk-key` is knowingly red:
+   it fails 8 of 9 rows** (`FAIL (8 failures)`), and that is the expected state of
+   this contract — see §Known conflicts. Anything else, including a link error or a
+   different count, is a new fact and needs looking at.
 4. Live smoke on the port: a `/v1/responses` tool round trip completes with no
    400 (B1), and the log shows normal `responses live continuation` hits. The
    fork-heal (B2) only shows up under a forked-history repro, and the reuse
    tiers from group A show up in `~/.ds4/fc-debug/` trace captures.
+
+### Verification record
+
+Re-verified 2026-10-31 against upstream **`c97964b`** (13 commits past `ee7e840`, the
+base of the binary running now) after A6 was regenerated and B9 added. Every patch
+applies: A1 and A2 with `-3` as documented, A6 and all nine group-B patches **clean**.
+`ds4-server` builds with zero errors and the same two `-Wpointer-sign` warnings;
+`ds4_test --server` → `ds4 tests: ok`; `test-kvstore-near-tail` → `PASS`;
+`test-qwen-tool-disk-key` links and reports the documented `FAIL (8 failures)`
+(§Known conflicts). Step 4 is still **not** done: the live server was never restarted
+onto a patched binary.
+
+A reverse-apply check (`git apply -R --check` on clean `c97964b`) reads `absent` for
+every one of the 17 patches: **none of what we carry has been merged upstream**, so
+none can be dropped. That check is the cheap way to answer "do we still need these" —
+recorded here so the next survey runs it instead of reading PR pages.
+
+What upstream added since `fc80bd6`, that touches us: Qwen PLE prefetch (#1154) and
+Q4_K raw-load register reuse (`docs/QWEN38_Q4_REGISTER_REUSE.md`, +2.376% text and
++2.274% C-source prefill on M5 Max 128 GiB at 8192-token chunks, decode unchanged);
+`a8ce74a` renders blank reasoning as absent, which stops one stray body token from
+breaking every later prefix match; `2768d0e` fixes a progressive-JPEG out-of-bounds
+that upstream states is reachable from request images when `--vision` is enabled.
+Consequence: **numbers captured on the `fc80bd6` binary are not a baseline** for a
+current one.
 
 ## Swapping the live server onto a fresh build
 

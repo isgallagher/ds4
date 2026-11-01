@@ -254,12 +254,29 @@ cd "$(dirname "$0")"
 REF="${REF:-main}"
 UPSTREAM="https://github.com/antirez/ds4.git"
 
-# --- 1. Fetch latest upstream (anonymous HTTPS; bypass the global insteadOf) ---
-echo "fetching upstream ${REF} ..."
-FRESH=$(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+# --- 1. Fetch upstream (anonymous HTTPS; bypass the global insteadOf) ---
+# REF is either a branch name (default: main) or an exact commit to build from.
+# A raw SHA cannot be fetched by name — the remote refuses sha1-in-want for a
+# commit that is not a ref tip — so a pinned commit is resolved from this
+# object store instead of fetched. Without this branch the documented
+# `REF=<sha> ./build.sh` died with "couldn't find remote ref <sha>" (observed
+# 2026-11-01), which is the failure that makes a re-verified contract
+# unbuildable once upstream has moved.
+if printf '%s' "${REF}" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
+    echo "upstream ${REF} is a pinned commit; resolving locally, no fetch ..."
+    FRESH=$(git rev-parse --verify "${REF}^{commit}") || {
+        echo "not in this object store: ${REF}" >&2
+        echo "fetch it first, e.g. git fetch origin main, then retry" >&2
+        exit 1
+    }
+    echo "upstream ${REF} = ${FRESH} (pinned)"
+else
+    echo "fetching upstream ${REF} ..."
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
         git -c credential.helper= fetch --quiet "${UPSTREAM}" "${REF}" \
-        && git rev-parse FETCH_HEAD)
-echo "upstream ${REF} = ${FRESH}"
+        && FRESH=$(git rev-parse FETCH_HEAD)
+    echo "upstream ${REF} = ${FRESH}"
+fi
 
 # --- 2. Throwaway worktree at that upstream commit, patches applied ---
 WT=$(mktemp -d /tmp/ds4-build-XXXXXX)
@@ -336,5 +353,9 @@ chmod +x ./ds4-server
 # at startup by macOS code signing ("Invalid Page" inside dyld). See
 # docs/BUILD_PATCHES.md §Swapping the live server.
 codesign --force -s - ./ds4-server
-echo "done: ./ds4-server built from upstream ${FRESH} + 8 upstream PR patches + 11 local patches"
+# The counts are counted, not written down: a hardcoded pair went stale twice
+# (it read "8 upstream PR patches + 11 local patches" while the sequence was 21).
+N_UP=$(grep -c '^apply patches/upstream/' "$0" || true)
+N_LOCAL=$(grep -c '^apply patches/0' "$0" || true)
+echo "done: ./ds4-server built from upstream ${FRESH} + ${N_UP} upstream PR patches + ${N_LOCAL} local patches"
 echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

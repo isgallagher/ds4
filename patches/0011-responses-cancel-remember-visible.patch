@@ -1,0 +1,156 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index a8e4f85..0d21a10 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -13378,6 +13378,37 @@ static void responses_live_remember_turn(server *s, server_slot *slot,
+     free(suffix);
+ }
+ 
++/* An interrupted Responses turn still leaves a usable live frontier: the KV
++ * holds the sampled tokens, and a client that continues the conversation
++ * re-renders the partial turn in its next request.  The pre-fix cancel path
++ * cleared every live handle, so that next request reused nothing: routing
++ * found no slot worth keeping, evicted a resident checkpoint, and the whole
++ * prompt re-prefilled from token zero (observed 2026-10-31 19:48: 201,688
++ * tokens, 229 s, for a conversation 31 tokens from its frontier).  Remember
++ * the visible surface at the CURRENT frontier instead, exactly as the
++ * completed-turn path builds it: the visible tier's strict live_tokens
++ * equality then holds, the next request continues from live KV, and only
++ * the new tail tokenizes.  If the client replays bytes the server never
++ * streamed, or drops the aborted turn, the byte-prefix check fails and the
++ * request misses exactly as before the fix - a safe miss, never a wrong
++ * reuse.  Non-Responses cancels keep the full clear.  Returns true when the
++ * Responses visible state was remembered (for the cancel log line). */
++static bool responses_cancel_release_live(server *s, server_slot *slot,
++                                          const job *j,
++                                          const char *content,
++                                          const char *reasoning,
++                                          const tool_calls *calls) {
++    if (j->req.api != API_RESPONSES) {
++        request_live_state_clear(s, slot);
++        return false;
++    }
++    responses_live_remember_turn(s, slot, &j->req,
++                                 content ? content : "", reasoning, calls);
++    thinking_live_clear(s, slot);
++    anthropic_live_clear(s, slot);
++    return true;
++}
++
+ /* Clients can omit old assistant reasoning from later prompts, including Qwen
+  * text answers with tool schemas. The sampled live graph still contains the
+  * reasoning bytes, so the next request would miss the session cache even though
+@@ -15191,7 +15222,13 @@ decode_again:
+             }
+         }
+         if (job_cancelled(j)) {
+-            request_live_state_clear(s, slot);
++            const bool cancel_visible =
++                responses_cancel_release_live(s, slot, j, parsed_content,
++                                              parsed_reasoning, &parsed_calls);
++            server_log(DS4_LOG_KVCACHE,
++                       "ds4-server: generation cancelled mid-turn live=%d visible-state=%s",
++                       ds4_session_pos(slot->session),
++                       cancel_visible ? "remembered" : "cleared");
+             trace_event(s, trace_id, "cancelled during response parsing");
+             free(parsed_content);
+             free(parsed_reasoning);
+@@ -15215,7 +15252,13 @@ decode_again:
+         }
+     }
+     if (job_cancelled(j)) {
+-        request_live_state_clear(s, slot);
++        const bool cancel_visible =
++            responses_cancel_release_live(s, slot, j, parsed_content,
++                                          parsed_reasoning, &parsed_calls);
++        server_log(DS4_LOG_KVCACHE,
++                   "ds4-server: generation cancelled mid-turn live=%d visible-state=%s",
++                   ds4_session_pos(slot->session),
++                   cancel_visible ? "remembered" : "cleared");
+         trace_event(s, trace_id, "cancelled before publishing response state");
+         free(parsed_content);
+         free(parsed_reasoning);
+@@ -17810,6 +17853,75 @@ static void test_slot_probe_live_state_tiers(void) {
+     /* 7. Parent-guarded tool-ID tier: unchanged replays keep the fast path,
+      *    rewritten histories cannot reuse the old frontier by call id. */
+     test_slot_probe_tool_parent_guard();
++
++    /* 8. Post-cancel shape (0011): the visible handle sits at the CURRENT
++     *    frontier and its text carries the partial reasoning the abort left
++     *    in KV.  A client that replays the aborted turn extends that text,
++     *    so the tier matches at the frontier and only the new tail
++     *    tokenizes - the escape-and-continue case that cost a full
++     *    201,688-token re-prefill on 2026-10-31.  A client that drops the
++     *    aborted turn diverges inside the remembered text: safe miss. */
++    {
++        server_slot slot = {0};
++        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
++        slot.responses_live.valid = true;
++        slot.responses_live.live_tokens = 10;
++        slot.responses_live.visible_text = xstrdup("v partial thinking ");
++        slot.responses_live.visible_len =
++            strlen(slot.responses_live.visible_text);
++        job j = {0};
++        j.req.api = API_RESPONSES;
++        j.req.prompt_text = xstrdup("v partial thinking new user turn");
++        for (int i = 0; i < 12; i++) ds4_tokens_push(&j.req.prompt, i + 1);
++        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
++        TEST_ASSERT(pr.kind == REUSE_RESPONSES_VISIBLE);
++        TEST_ASSERT(pr.reuse_tokens == 10);
++        TEST_ASSERT(pr.suffix_off == slot.responses_live.visible_len);
++        /* Dropped aborted turn: text diverges and tokens do not extend, so
++         * every tier declines and routing falls back to pre-fix behavior. */
++        free(j.req.prompt_text);
++        j.req.prompt_text = xstrdup("v other continuation");
++        j.req.prompt.len = 0;
++        ds4_tokens_push(&j.req.prompt, 999);
++        ds4_tokens_push(&j.req.prompt, 998);
++        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind ==
++                    REUSE_NONE);
++        live_tool_state_free(&slot.responses_live);
++        ds4_session_free_test_checkpoint(slot.session);
++        request_free(&j.req);
++    }
++}
++
++/* 0011 cancel shape: a Responses cancel remembers the visible handle at the
++ * live frontier instead of clearing it; a non-Responses cancel keeps the
++ * full clear. The shape escape-and-continue depends on is
++ * responses_live.live_tokens == ds4_session_pos(). */
++static void test_responses_cancel_release_live(void) {
++    server s = {0};
++    server_slot slot = {0};
++    int ckpt_tok[10];
++    for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
++    slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
++    job j = {0};
++    j.req.api = API_RESPONSES;
++    j.req.prompt_text = xstrdup("conv prompt ");
++    ds4_tokens_push(&j.req.prompt, 999);
++    TEST_ASSERT(responses_cancel_release_live(&s, &slot, &j, "",
++                                              "partial thinking", NULL));
++    TEST_ASSERT(slot.responses_live.valid);
++    TEST_ASSERT(slot.responses_live.live_tokens == 10);
++    TEST_ASSERT(slot.responses_live.visible_len > 12);
++    TEST_ASSERT(!memcmp(slot.responses_live.visible_text, "conv prompt ", 12));
++    /* A non-Responses cancel on the same slot clears everything. */
++    slot.thinking_live.valid = true;
++    j.req.api = API_OPENAI;
++    TEST_ASSERT(!responses_cancel_release_live(&s, &slot, &j, "", NULL, NULL));
++    TEST_ASSERT(!slot.responses_live.valid);
++    TEST_ASSERT(!slot.thinking_live.valid);
++    live_tool_state_free(&slot.responses_live);
++    visible_live_free(&slot.thinking_live);
++    ds4_session_free_test_checkpoint(slot.session);
++    request_free(&j.req);
+ }
+ 
+ /* Vision tiers: image appends must reuse, pixel mismatches must not, and
+@@ -25020,6 +25132,7 @@ static void ds4_server_unit_tests_run(void) {
+     test_live_continuation_contract();
+     test_live_kv_keeps_replayed_turn_end_token();
+     test_slot_probe_and_routing_scores();
++    test_responses_cancel_release_live();
+     test_slot_probe_live_state_tiers();
+     test_slot_probe_vision_tiers();
+     test_slot_routing_staleness_tiers();

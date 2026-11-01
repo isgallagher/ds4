@@ -33,6 +33,8 @@ we build on while they wait for merge; group B is our own fixes.
 | B7 | `patches/0008-kv-discard-reason-per-decision-site.patch` | `kv_cache_discard_disk_entry(s, slot, path, reason)` — the three discard sites get distinct reasons (`forked-payload`, `cold-prefix-sync-failed`, `prompt-sync-failed`, `cancelled-during-*`) instead of one `prefill-failed`. Diagnostic only: same unlink, same invalidation | ours, no PR |
 | B8 | `patches/0009-kv-tail-pool-sizes-with-resident-sessions.patch` | near-tail pool sized per resident session: cap 16 GiB → 16 GiB × sessions, entry limit 2 → 2 × sessions, from `ds4_kvstore.resident_sessions` set to `slot_count`. `0` reads as `1`, so single-session behaviour is unchanged and A4's test passes untouched. Extends `tests/test_kvstore_near_tail` with the policy cases (unset → 16 GiB at a 240 GiB budget, 2 sessions → 30 GiB, 3 and 8 → 30 GiB, share binds). **Touches 4 files** (`ds4_kvstore.h/.c`, `ds4_server.c`, the test) — the deviation from "local patches touch `ds4_server.c` only" is because the sizing lives in the store | ours, no PR |
 | B9 | `patches/0010-kvstore-test-stub-payload-bytes.patch` | stub `ds4_session_payload_bytes` in A6's model-free test so it links once A4 is in the tree (A4 made the store call it; the symbol lives in `ds4.c`, which that target does not link). A4 ships the same stub in its own test | ours, no PR |
+| B10 | `patches/0011-responses-cancel-remember-visible.patch` | a cancelled Responses turn now **remembers** the visible surface at the current frontier (via the turn-end builder) instead of clearing every live handle, and both cancel branches log. Fixes the escape-and-continue full re-prefill (2026-10-31 19:48: 201,688 tokens / 229 s for a conversation 31 tokens from its frontier) and the two-sessions-old "missing disconnect line" mystery (the branches were silent). No KV rewind — rewind is GLM-only; remembering at the frontier keeps the visible tier's strict `live_tokens == live_pos`. Mismatching clients miss safely, as before the fix. Tests: probe case 8 + `test_responses_cancel_release_live` | ours, no PR |
+| B11 | `patches/0012-kv-fork-next-shorter-candidate.patch` | a forked visible-keyed disk payload no longer ends the disk tier: the 0007 discard stays (protective), the lookup is retried (the refresh inside rescans the store directory, so the discarded file is never offered again), and the next-shorter candidate gets its own lockstep check — a pre-fork ladder checkpoint is token-exact and loads. Bounds any re-render fork at prompt−frontier (2026-10-31 shape: 229 s → ~154 s). Bounded at 4 attempts; live-smoke-verified, same verification shape as B6 | ours, no PR |
 
 - **Tracker for group A:** upstream issue #1201. Its merge order is
   `1175 → 1169 → 1206 → 1200`, with "#1206 must merge after #1169" (it relies on
@@ -96,7 +98,7 @@ tracker order does not contain them both.
 |---|---|---|
 | Build script | `~/repos/ds4/build.sh` | fetch → patch → build → install → re-sign |
 | Upstream PR patches | `patches/upstream/` | stored verbatim diffs, pinned by the SHAs above |
-| Our patches | `patches/` | `0001`…`0004`, `0006`…`0010` (0005 is archived), numbered; next is `0011` |
+| Our patches | `patches/` | `0001`…`0004`, `0006`…`0012` (0005 is archived), numbered; next is `0013` |
 | Archived patch | `patches/archive/` | kept for the record, never applied |
 | Upstream repo | `origin` = `git@github.com:antirez/ds4` (SSH — unusable on this box, see §Fetch) | upstream branch is **`main`**, not `master` |
 | Local fix branch | `fix/responses-replay-status-tolerance` | carries `build.sh` + `patches/` + docs; **not** pushed |
@@ -286,6 +288,17 @@ breaking every later prefix match; `2768d0e` fixes a progressive-JPEG out-of-bou
 that upstream states is reachable from request images when `--vision` is enabled.
 Consequence: **numbers captured on the `fc80bd6` binary are not a baseline** for a
 current one.
+
+**B10 + B11 added 2026-11-01** (escape-interrupt full re-prefill, owner-confirmed
+incident 2026-10-31 19:48 — full diagnosis in `docs/RESPONSES_CACHE_MISS.md` §10).
+Both apply **clean** on `c97964b` after the 17-patch sequence; `ds4-server` builds
+with zero errors and the same two `-Wpointer-sign` warnings; `ds4_test --server` →
+`server: OK`, `ds4 tests: ok` (new: probe case 8, `test_responses_cancel_release_live`);
+fresh-tree byte-identity vs the tested tree holds. **Step 4 is owed**: escape
+mid-thinking in one batched client, send the next message, expect
+`generation cancelled mid-turn … visible-state=remembered` then a short prefill with
+no `forked-payload` discard; and a compaction turn to exercise the B11 candidate
+retry.
 
 ## Swapping the live server onto a fresh build
 

@@ -159,6 +159,34 @@
 #       and A6 (PR #1212) changed the same key-and-suffix rule from opposite sides
 #       and upstream never ran them together. That red is documented in
 #       docs/BUILD_PATCHES.md and is NOT this patch's concern.
+#   0011-responses-cancel-remember-visible.patch
+#       An interrupted Responses turn cleared every live handle, so the next
+#       request (the escape-and-continue message) reused nothing: routing
+#       evicted a resident checkpoint and the whole prompt re-prefilled
+#       (observed 2026-10-31 19:48: 201,688 tokens, 229 s, for a conversation
+#       31 tokens from its frontier). The visible tier also cannot fire after
+#       an abort even without the clear: the handle sits at the last
+#       completed-turn boundary and the tier demands live_tokens == live_pos.
+#       On the cancel branches, remember the visible surface at the CURRENT
+#       frontier via the same turn-end builder (strict equality then holds;
+#       no KV rewind is needed - rewind is GLM-only), and log the cancel -
+#       those branches were silent, which is why the Oct-17 and Oct-31
+#       disconnect lines were "missing". A client that replays bytes the
+#       server never streamed, or drops the aborted turn, misses exactly as
+#       before: a safe miss, never a wrong reuse. Tests: probe case 8 +
+#       test_responses_cancel_release_live.
+#   0012-kv-fork-next-shorter-candidate.patch
+#       A forked visible-keyed disk payload ended the disk tier and the turn
+#       re-prefilled from token zero. The 0007 discard stays (protective),
+#       but the turn now retries the lookup: the refresh inside the lookup
+#       rescans the store directory, so the discarded file is never offered
+#       again and the next-shorter text-prefix candidate gets its own
+#       lockstep check. A pre-fork ladder checkpoint is token-exact by
+#       construction and loads; recovery costs prompt-minus-frontier instead
+#       of the whole prompt (observed shape: 172k rejected above 65k ladder
+#       files; full 229 s prefill becomes ~154 s). Bounded at 4 attempts.
+#       Live-smoke-verified (model-free unit coverage is the refresh-rescan
+#       behavior the loop depends on; precedent: 0007 shipped the same way).
 #
 # ARCHIVE: patches/archive/0005-…superseded-by-pr-1206.patch — our FIX-1. The
 # visible-suffix gate change is replaced by #1206's two-key design, which also
@@ -254,6 +282,8 @@ apply patches/0007-responses-fork-guard-visible-keys.patch
 apply patches/0008-kv-discard-reason-per-decision-site.patch
 apply patches/0009-kv-tail-pool-sizes-with-resident-sessions.patch
 apply patches/0010-kvstore-test-stub-payload-bytes.patch
+apply patches/0011-responses-cancel-remember-visible.patch
+apply patches/0012-kv-fork-next-shorter-candidate.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim
@@ -268,5 +298,5 @@ chmod +x ./ds4-server
 # at startup by macOS code signing ("Invalid Page" inside dyld). See
 # docs/BUILD_PATCHES.md §Swapping the live server.
 codesign --force -s - ./ds4-server
-echo "done: ./ds4-server built from upstream ${FRESH} + 8 upstream PR patches + 9 local patches"
+echo "done: ./ds4-server built from upstream ${FRESH} + 8 upstream PR patches + 11 local patches"
 echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"

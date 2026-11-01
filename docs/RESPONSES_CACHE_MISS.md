@@ -220,3 +220,51 @@ self-observed rather than third-party. The disk tier started empty, so no disk-h
 evidence was produced — that path is still untested in the field. And the pool is
 sized by **slot count**: a third long conversation beyond `SESSIONS=2` will still
 evict, by design.
+
+## 10. Escape-interrupt full re-prefill (2026-10-31 19:48) — third cause: an interrupted turn strands every handle
+
+**Symptom.** Owner pressed escape in a pi session mid-thinking and sent the next
+message 26 s later. The conversation sat 31 tokens from its live frontier; the
+server re-prefilled the whole 201,688-token prompt (229 s) instead of a few dozen
+tokens. Log: `~/ds4-batched.log` (pid 1031), batched-vision profile.
+
+**Timeline (log + session file `01a18aac`, all verified).** 19:48:04 last turn's
+prefill done (`prompt=201644`); ~19:48:05.7 escape — the session record shows a
+thinking-only assistant turn, `stopReason: aborted`, 1849 ms; slot 1 froze at
+**201675 = 201644 + 31**. 19:48:31.8 the new user message → prompt 201688 →
+`live kv cache miss live=172631 prompt=201688 common=110092` → the visible-keyed
+disk candidate (172094) was verified, forked, discarded → prefill from token 0.
+19:48:47 the re-prefill evicted slot 1's 201675-token frontier (stored to disk on
+eviction, 19:51:09).
+
+**Two independent killers, each sufficient alone.**
+1. Both cancel branches (`ds4_server.c:15193`, `:15217` in the contract tree)
+   cleared every live handle — including the visible-transcript handle, the only
+   tier that survives a next turn without tool-call ids. Both branches were
+   **silent** (`trace_event` only, no `server_log`): this is why the Oct-17 and
+   Oct-31 "missing `client disconnected`" lines never appeared — the decode loop
+   stops only on stop-request or job-cancel, so the branches ran.
+2. Even without the clear, the visible tier demands `live_tokens == live_pos`,
+   and `responses_live_remember` fires only at completed-turn boundaries. An
+   interrupted turn advances the frontier and strands the handle (201231 vs
+   201675). The tier can only fire at turn boundaries.
+
+With every tier declining on both slots, the router chose the cheapest *victim*
+(slot 0, a stale 172631 checkpoint of the same conversation), missed at
+common=110092, and patch 0007's guard discarded the forked disk payload
+whole — the valid 110092-token common was never reused. The 110092 fork is
+**token-level** (fresh full-prompt BPE vs incrementally appended continuation
+tokens), not a history rewrite: the session file is append-only in the window,
+and each earlier turn's `match=visible-prefix`/`tool-output-ids` proves the
+visible bytes agreed at every frontier up to the abort.
+
+**Fixes (patches 0011 + 0012, `docs/BUILD_PATCHES.md` B10/B11).** 0011: the
+cancel branches remember the visible surface at the CURRENT frontier via the
+turn-end builder (strict equality then holds; KV rewind is GLM-only, so the
+handle must move to the frontier, not the frontier back to the handle) and log
+the cancel. 0012: a forked disk payload no longer ends the disk tier — the
+discard stays, the lookup retries, and the next-shorter token-exact candidate
+loads. Cost ledger for this incident: actual 229 s; 0012 alone ≈ 154 s; 0011 ≈
+tail only (~1 s). **Known gap:** if the client re-sends before the server
+notices the disconnect (~100 ms poll), the frontier slot is still busy and
+routing evicts it anyway — routing-level, deferred.

@@ -98,9 +98,10 @@ tracker order does not contain them both.
 
 | Artifact | Path | Notes |
 |---|---|---|
-| Build script | `~/repos/ds4/build.sh` | fetch → patch → build → install → re-sign |
+| Build script | `~/repos/ds4/build.sh` | resolve → patch → build → install → re-sign |
+| **Contract commit** | `CONTRACT_REF` in `build.sh` (today **`c97964b`**) | the upstream commit the whole patch set is verified on; it is the **default**, so a plain `./build.sh` never builds an unverified tree |
 | Upstream PR patches | `patches/upstream/` | stored verbatim diffs, pinned by the SHAs above |
-| Our patches | `patches/` | `0001`…`0004`, `0006`…`0012` (0005 is archived), numbered; next is `0013` |
+| Our patches | `patches/` | `0001`…`0004`, `0006`…`0014` (0005 is archived), numbered; next is `0015` |
 | Archived patch | `patches/archive/` | kept for the record, never applied |
 | Upstream repo | `origin` = `git@github.com:antirez/ds4` (SSH — unusable on this box, see §Fetch) | upstream branch is **`main`**, not `master` |
 | Local fix branch | `fix/responses-replay-status-tolerance` | carries `build.sh` + `patches/` + docs; **not** pushed |
@@ -112,8 +113,9 @@ tracker order does not contain them both.
 
 1. **A patch that won't apply → hard stop, before compiling.** `apply()` tries a
    plain `git apply`, then a 3-way (`-3`) apply, and stops with the patch name
-   and the error if both fail. Never let a half-applied tree build. Your options,
-   in order: pin (`REF=<sha> ./build.sh`), or rebase the patch (§Rebasing).
+   and the error if both fail. Never let a half-applied tree build. On the
+   contract commit this means the patch set itself moved (a rebase of the patch
+   is due, §Rebasing); anywhere else it means you are off-contract (§C).
 2. **Conflict markers are a build error.** A 3-way merge can "succeed" while
    leaving `<<<<<<<` markers in the file. After every patch `apply()` greps the
    whole tree for markers and stops if any survive, so you get "CONFLICT MARKERS
@@ -123,13 +125,19 @@ tracker order does not contain them both.
    "which patch broke this tree" answerable.
 4. **Order matters and is fixed.** Group A in tracker order, then group B in
    number order. Keep the numbering: the next free local patch number is
-   `0011` (0005 is archived), and its `apply` line goes after the existing ones.
+   `0015` (0005 is archived), and its `apply` line goes after the existing ones.
 5. **The working tree is never a build input.** The build happens in a throwaway
    `git worktree` at the fetched upstream commit; only `./ds4-server` comes back
    out, and `codesign --force -s -` runs on it (see §Swapping the live server).
-6. **`REF=<sha>` pins the upstream side.** `REF=fc80bd6 ./build.sh` reproduces
-   the 2026-10-16 build regardless of what upstream does. Use it to separate
-   "upstream moved" from "my patch changed".
+6. **`CONTRACT_REF` is the default upstream, and it is a pin, not a branch.** A
+   plain `./build.sh` resolves it from the local object store and touches no
+   network. `REF=<sha> ./build.sh` builds another commit and prints a notice when
+   it is not the contract commit; `REF=main ./build.sh` fetches current upstream
+   and is the way to *start* a re-verification (safety behavior 1 will stop it).
+   Reproducing an old build is the same trick: `REF=fc80bd6 ./build.sh` rebuilds
+   the 2026-10-16 tree. This is what separates "upstream moved" from "my patch
+   changed" — on 2026-11-01 `main` reached `b4e3faf`, `pr1175` stopped applying at
+   `ds4_server.c:9937`, and the pinned build kept working.
 
 ## Why A3 is not the raw PR
 
@@ -185,14 +193,23 @@ Rules of thumb:
 
 ### C. Upstream `main` moved and a patch no longer applies
 
-`build.sh` stops and names the failing patch. Two moves:
-- **Temporary:** `REF=<last-known-good-sha> ./build.sh`.
-- **Proper (rebase the patch):**
+This is what `REF=main ./build.sh` hits, and it is why the default is a pin: the
+build stops and names the failing patch while the contract commit still builds
+fine. Measured 2026-11-01: `main` = `b4e3faf`, 4 commits past the contract, 47
+changed lines in `ds4_server.c`, and `pr1175` conflicts in exactly 1 hunk.
+
+Two moves:
+- **Keep building:** `./build.sh`. The default *is* the last verified commit, so
+  nothing is owed to keep working. The cost is that upstream features stay out.
+- **Move the contract (rebase the patches):**
   1. `git worktree add /tmp/ds4-rebase <new-main-sha>` (detached).
   2. Apply the earlier patches in order, then `git apply --check` the failing
      one. The error and hunk context show what upstream changed around the fix.
   3. Edit the patch (or regenerate it against the new base) so it applies.
-  4. `git worktree remove --force /tmp/ds4-rebase`; run `./build.sh`; verify.
+  4. `git worktree remove --force /tmp/ds4-rebase`; run the full verification
+     (§Verification after any build change) **on the new commit**, not on the old one.
+  5. Change `CONTRACT_REF` in `build.sh` in the same commit as the rebased
+     patches, so the pin and the verification can never disagree.
 
   The fix's *logic* does not change during a rebase — only its context lines. If
   a hunk needs a logic change, stop: that is a new interaction, not a rebase.

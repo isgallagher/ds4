@@ -1,6 +1,7 @@
 #!/bin/bash
 # build.sh — reproducible local build:
-#   1. fetch the latest upstream main from antirez/ds4 (anonymous HTTPS)
+#   1. resolve the upstream commit to build from (default: CONTRACT_REF below, no
+#      network; REF=<branch> fetches that branch from antirez/ds4 over HTTPS)
 #   2. apply the upstream PR patches, then our local patches, in a throwaway worktree
 #   3. build ./ds4-server, install it, ad-hoc re-sign it
 #
@@ -239,8 +240,9 @@
 # normally, the bypass is harmless (it just also works).
 #
 # Usage:
-#   ./build.sh                 # build ./ds4-server from upstream main + patches
-#   REF=<sha> ./build.sh       # build from a specific upstream commit instead
+#   ./build.sh                 # build ./ds4-server from CONTRACT_REF + patches
+#   REF=<sha> ./build.sh       # build from a different upstream commit
+#   REF=main ./build.sh        # build current upstream main (expects re-verification)
 #
 # If a patch no longer applies, the build STOPS with the patch named and a
 # `git apply` error — resolve it deliberately (docs/BUILD_PATCHES.md) rather
@@ -251,31 +253,55 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-REF="${REF:-main}"
+# CONTRACT_REF is the upstream commit the whole patch set in patches/ is verified
+# against, and it is the default so a plain ./build.sh always builds a tree the
+# contract is known to apply to. Upstream moves without asking: on 2026-11-01
+# `main` was `b4e3faf` and `pr1175` stopped applying (`ds4_server.c:9937`), so an
+# unpinned build failed for a reason that was not a defect in this repo. Pinning
+# makes the failure disappear and puts the decision where it belongs.
+#
+# Move this line only as part of a re-verification, never to chase a feature:
+# forward-apply every patch on the new commit, build both model-free targets,
+# then swap the pin in the same commit (docs/BUILD_PATCHES.md §C.3).
+CONTRACT_REF="c97964b"
+REF="${REF:-${CONTRACT_REF}}"
 UPSTREAM="https://github.com/antirez/ds4.git"
 
-# --- 1. Fetch upstream (anonymous HTTPS; bypass the global insteadOf) ---
-# REF is either a branch name (default: main) or an exact commit to build from.
-# A raw SHA cannot be fetched by name — the remote refuses sha1-in-want for a
-# commit that is not a ref tip — so a pinned commit is resolved from this
+# --- 1. Resolve the upstream commit to build from ---
+# REF is either an exact commit (the default, CONTRACT_REF) or a branch name to
+# fetch. A raw SHA cannot be fetched by name — the remote refuses sha1-in-want
+# for a commit that is not a ref tip — so a pinned commit is resolved from this
 # object store instead of fetched. Without this branch the documented
 # `REF=<sha> ./build.sh` died with "couldn't find remote ref <sha>" (observed
 # 2026-11-01), which is the failure that makes a re-verified contract
 # unbuildable once upstream has moved.
+CONTRACT_SHA=$(git rev-parse --verify "${CONTRACT_REF}^{commit}" 2>/dev/null || echo "unknown")
+note_off_contract() {
+    if [ "${FRESH}" != "${CONTRACT_SHA}" ]; then
+        echo "NOTE: building ${FRESH}, which is NOT the contract commit ${CONTRACT_SHA}." >&2
+        echo "      The patch set is verified on the contract commit only. A patch failure" >&2
+        echo "      here is expected until someone re-verifies here and moves CONTRACT_REF." >&2
+    fi
+}
 if printf '%s' "${REF}" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
     echo "upstream ${REF} is a pinned commit; resolving locally, no fetch ..."
-    FRESH=$(git rev-parse --verify "${REF}^{commit}") || {
+    FRESH=$(git rev-parse --verify "${REF}^{commit}" 2>/dev/null) || {
         echo "not in this object store: ${REF}" >&2
-        echo "fetch it first, e.g. git fetch origin main, then retry" >&2
+        echo "if it is a real commit, it is an ancestor of upstream main, and a branch" >&2
+        echo "fetch brings it: GIT_CONFIG_GLOBAL=/dev/null git -c credential.helper= \\" >&2
+        echo "                     fetch ${UPSTREAM} main" >&2
+        echo "and retry (this box cannot reach origin over SSH; see §Fetch in the runbook)." >&2
         exit 1
     }
-    echo "upstream ${REF} = ${FRESH} (pinned)"
+    echo "upstream ${REF} = ${FRESH} (pinned commit, no fetch)"
+    note_off_contract
 else
     echo "fetching upstream ${REF} ..."
     GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
         git -c credential.helper= fetch --quiet "${UPSTREAM}" "${REF}" \
         && FRESH=$(git rev-parse FETCH_HEAD)
     echo "upstream ${REF} = ${FRESH}"
+    note_off_contract
 fi
 
 # --- 2. Throwaway worktree at that upstream commit, patches applied ---
@@ -297,8 +323,13 @@ apply() {
     else
         echo "" >&2
         echo "PATCH DOES NOT APPLY on upstream ${FRESH}: ${p}" >&2
-        echo "(upstream or the cluster moved; see docs/BUILD_PATCHES.md §Rebasing a patch," >&2
-        echo " or pin with REF=<old-sha>)" >&2
+        if [ "${FRESH}" = "${CONTRACT_SHA}" ]; then
+            echo "(this IS the contract commit, so the patch set itself changed since it" >&2
+            echo " was verified — see docs/BUILD_PATCHES.md §Rebasing a patch)" >&2
+        else
+            echo "(upstream or the cluster moved; see docs/BUILD_PATCHES.md §Rebasing a patch," >&2
+            echo " or build the verified contract commit with no REF at all)" >&2
+        fi >&2
         sed -n '1,40p' /tmp/ds4-build-apply.err >&2
         exit 1
     fi

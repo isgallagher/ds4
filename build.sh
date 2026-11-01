@@ -187,6 +187,29 @@
 #       files; full 229 s prefill becomes ~154 s). Bounded at 4 attempts.
 #       Live-smoke-verified (model-free unit coverage is the refresh-rescan
 #       behavior the loop depends on; precedent: 0007 shipped the same way).
+#   0013-responses-cancel-remember-partial-visible.patch
+#       Scope fix for 0011: the escape path does not reach the branches 0011
+#       instruments. generate_job_inner has SEVEN request_live_state_clear()
+#       sites under job_cancelled, and an interrupted decode returns at the
+#       first one after the decode loop ("cancelled during generation after
+#       N tokens"), which 0011 left as a silent clear - so 0011's log line can
+#       never appear for an escape, and the 2026-11-01 23:14/23:18 recoveries
+#       came from the disk and memory-token tiers, not from 0011. That branch
+#       also cannot reuse 0011's helper: the completed-turn builder closes the
+#       surface with the model's end-of-turn marker, and a cancelled turn never
+#       commits that token (the decode path skips it under cancel), so the
+#       handle would claim one token more than the live KV holds - wrong reuse,
+#       not the safe miss the tier contract demands. This patch remembers a
+#       PARTIAL surface instead: prompt text + reasoning-so-far, or prompt text
+#       + content-so-far, with no marker appended, so the next request
+#       re-tokenizes the boundary and end-of-turn tokens onto the live KV. Only
+#       a single-surface partial qualifies (a partial with both needs the
+#       boundary marker between them; a partial that reached a tool call needs
+#       the call markup), and everything else keeps the pre-fix clear. The
+#       parser is asked without the closed-thinking requirement, because the
+#       cancelled turn is unclosed by definition. Test:
+#       test_responses_cancel_release_live_partial (mutation-checked: breaking
+#       the surface-length assertion turns the suite red).
 #
 # ARCHIVE: patches/archive/0005-…superseded-by-pr-1206.patch — our FIX-1. The
 # visible-suffix gate change is replaced by #1206's two-key design, which also
@@ -284,6 +307,7 @@ apply patches/0009-kv-tail-pool-sizes-with-resident-sessions.patch
 apply patches/0010-kvstore-test-stub-payload-bytes.patch
 apply patches/0011-responses-cancel-remember-visible.patch
 apply patches/0012-kv-fork-next-shorter-candidate.patch
+apply patches/0013-responses-cancel-remember-partial-visible.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim

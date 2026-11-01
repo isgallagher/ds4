@@ -33,8 +33,9 @@ we build on while they wait for merge; group B is our own fixes.
 | B7 | `patches/0008-kv-discard-reason-per-decision-site.patch` | `kv_cache_discard_disk_entry(s, slot, path, reason)` — the three discard sites get distinct reasons (`forked-payload`, `cold-prefix-sync-failed`, `prompt-sync-failed`, `cancelled-during-*`) instead of one `prefill-failed`. Diagnostic only: same unlink, same invalidation | ours, no PR |
 | B8 | `patches/0009-kv-tail-pool-sizes-with-resident-sessions.patch` | near-tail pool sized per resident session: cap 16 GiB → 16 GiB × sessions, entry limit 2 → 2 × sessions, from `ds4_kvstore.resident_sessions` set to `slot_count`. `0` reads as `1`, so single-session behaviour is unchanged and A4's test passes untouched. Extends `tests/test_kvstore_near_tail` with the policy cases (unset → 16 GiB at a 240 GiB budget, 2 sessions → 30 GiB, 3 and 8 → 30 GiB, share binds). **Touches 4 files** (`ds4_kvstore.h/.c`, `ds4_server.c`, the test) — the deviation from "local patches touch `ds4_server.c` only" is because the sizing lives in the store | ours, no PR |
 | B9 | `patches/0010-kvstore-test-stub-payload-bytes.patch` | stub `ds4_session_payload_bytes` in A6's model-free test so it links once A4 is in the tree (A4 made the store call it; the symbol lives in `ds4.c`, which that target does not link). A4 ships the same stub in its own test | ours, no PR |
-| B10 | `patches/0011-responses-cancel-remember-visible.patch` | a cancelled Responses turn now **remembers** the visible surface at the current frontier (via the turn-end builder) instead of clearing every live handle, and both cancel branches log. Fixes the escape-and-continue full re-prefill (2026-10-31 19:48: 201,688 tokens / 229 s for a conversation 31 tokens from its frontier) and the two-sessions-old "missing disconnect line" mystery (the branches were silent). No KV rewind — rewind is GLM-only; remembering at the frontier keeps the visible tier's strict `live_tokens == live_pos`. Mismatching clients miss safely, as before the fix. Tests: probe case 8 + `test_responses_cancel_release_live` | ours, no PR |
+| B10 | `patches/0011-responses-cancel-remember-visible.patch` | a cancelled Responses turn now **remembers** the visible surface at the current frontier (via the turn-end builder) instead of clearing every live handle, and both cancel branches log. Fixes the escape-and-continue full re-prefill (2026-10-31 19:48: 201,688 tokens / 229 s for a conversation 31 tokens from its frontier) and the two-sessions-old "missing disconnect line" mystery (the branches were silent). No KV rewind — rewind is GLM-only; remembering at the frontier keeps the visible tier's strict `live_tokens == live_pos`. Mismatching clients miss safely, as before the fix. Tests: probe case 8 + `test_responses_cancel_release_live`. **Scope corrected 2026-11-01 by B12: the escape path returns at an earlier branch and never reaches these two, so B10 does not serve the escape case — it serves a cancel that arrives after the decode loop finished. The "missing disconnect line" finding stands (five branches are still silent)** | ours, no PR |
 | B11 | `patches/0012-kv-fork-next-shorter-candidate.patch` | a forked visible-keyed disk payload no longer ends the disk tier: the 0007 discard stays (protective), the lookup is retried (the refresh inside rescans the store directory, so the discarded file is never offered again), and the next-shorter candidate gets its own lockstep check — a pre-fork ladder checkpoint is token-exact and loads. Bounds any re-render fork at prompt−frontier (2026-10-31 shape: 229 s → ~154 s). Bounded at 4 attempts; live-smoke-verified, same verification shape as B6 | ours, no PR |
+| B12 | `patches/0013-responses-cancel-remember-partial-visible.patch` | **the branch the escape actually takes.** `generate_job_inner` has seven `request_live_state_clear()` sites under `job_cancelled`; an interrupted decode returns at the first one after the loop ("cancelled during generation after N tokens"), which B10 left as a silent clear — so B10's log line could never appear for an escape, and the 23:14 / 23:18 recoveries were the disk and memory-token tiers. That branch cannot reuse B10's helper either: the completed-turn builder closes the surface with the model's end-of-turn marker, and a cancelled turn never commits that token, so the handle would claim one token more than the live KV holds — **wrong reuse, not the safe miss**. This patch remembers a **partial** surface (prompt text + reasoning-so-far, or + content-so-far, no marker appended) so the next request re-tokenizes the boundary and end-of-turn tokens onto the live KV; single-surface partials only, everything else keeps the clear. The parser is asked with the closed-thinking requirement off, because the cancelled turn is unclosed by definition. Test: `test_responses_cancel_release_live_partial`, mutation-checked | ours, no PR |
 
 - **Tracker for group A:** upstream issue #1201. Its merge order is
   `1175 → 1169 → 1206 → 1200`, with "#1206 must merge after #1169" (it relies on
@@ -298,7 +299,25 @@ fresh-tree byte-identity vs the tested tree holds. **Step 4 is owed**: escape
 mid-thinking in one batched client, send the next message, expect
 `generation cancelled mid-turn … visible-state=remembered` then a short prefill with
 no `forked-payload` discard; and a compaction turn to exercise the B11 candidate
-retry.
+retry. **Superseded for B10 by B12 (2026-11-01 late): the escape smoke cannot validate
+B10, because an interrupted decode returns at an earlier branch. B10's unit tests and its
+silent-branch finding stand; its escape claim does not.**
+
+**B12 added 2026-11-01 late** (the branch the escape takes — inventory in
+`docs/RESPONSES_CACHE_MISS.md` §11). Source-mapped with no restart and no log: a
+read-only worktree at `c97964b` with the then-19-patch sequence applied, one pass to
+enumerate every live-state clear site with its guard and whether it emits a
+`server_log` line. B12 applies **clean** after the 19; `ds4-server` and `ds4_test` build
+with zero errors and the same four `-Wpointer-sign` warnings (two sites, each seen in
+both targets); `ds4_test --server` → `server: OK`, `ds4 tests: ok`; fresh-tree
+byte-identity vs the tested tree holds; reverse-apply reads present on the built tree.
+The new test is **mutation-checked**: moving one byte of the surface-length assertion
+turns the suite red, which is the proof that the test executes.
+**Step 4 owed for B12:** escape mid-thinking in one batched client, send the next
+message, expect `generation cancelled mid-turn … visible-state=remembered-partial` then
+a near-tail prefill, no `forked-payload`, and no eviction of the frontier slot. Expect
+`visible-state=cleared` when the partial carried both reasoning and content, or reached
+a tool call — that is the designed safe miss, not a regression.
 
 ## Swapping the live server onto a fresh build
 

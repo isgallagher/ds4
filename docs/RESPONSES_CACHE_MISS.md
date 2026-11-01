@@ -268,3 +268,54 @@ loads. Cost ledger for this incident: actual 229 s; 0012 alone ≈ 154 s; 0011 �
 tail only (~1 s). **Known gap:** if the client re-sends before the server
 notices the disconnect (~100 ms poll), the frontier slot is still busy and
 routing evicts it anyway — routing-level, deferred.
+
+## 11. Why 0011 never fired: the cancel path is seven branches, not two (2026-11-01)
+
+**Method.** No restart, no log. A read-only worktree at `c97964b` with the patch
+sequence applied, then one pass over `generate_job_inner` enumerating every
+`request_live_state_clear()` site with its guard, its enclosing function, and
+whether it emits a `server_log` line. Line numbers below are that tree — the one
+the live binary was built from — **before** patch 0013, so they shift once 0013
+is in the sequence. Trace labels are the stable address.
+
+| Line | Trace label | Live state | `server_log` |
+|---|---|---|---|
+| 14460 | cancelled during prefill (prefix sync) | cleared | none |
+| 14498 | cancelled during prefill (prompt sync) | cleared | none |
+| 14510 | cancelled after prefill | cleared | none |
+| **15014** | **cancelled during generation after N tokens** | **cleared** | **none** |
+| 15140 | cancelled while flushing generation | cleared | none |
+| 15250 | cancelled during response parsing | 0011 remembers | yes (0011) |
+| 15280 | cancelled before publishing response state | 0011 remembers | yes (0011) |
+
+**15014 is the first cancel check after the decode loop**, so an interrupted turn
+returns there and never reaches the two branches 0011 instruments. Two
+consequences, both uncomfortable and both now recorded:
+
+1. The *missing* `generation cancelled mid-turn` line was never a paste artifact
+   and never a logging gap. The instrumented code cannot run on this path.
+2. **The §10 smoke did not validate 0011.** The 23:14 (9.2 s) and 23:18 (13 s)
+   recoveries came from the disk tier (0007/0012) and the memory-token tier. The
+   residency claim for the escape case is open again — with 0013 as the fix.
+
+**Why 0013 could not be a copy of 0011.** Three blockers, each read in source:
+
+1. At 15014 the parsed fields do not exist yet (`parsed_calls` / `parsed_content`
+   are declared further down), so the partial text is parsed in the new helper.
+2. **A cancelled turn never commits the end-of-turn token** — the decode path
+   skips it under cancel. A surface built by the completed-turn builder therefore
+   ends with a marker whose token the live KV never received, and the next request
+   would resume one token misaligned to its own text. That is wrong reuse, which
+   the tier contract forbids, not the safe miss §10 relies on.
+3. The Qwen surface builder emits reasoning text only when the turn carries tool
+   calls, so it cannot describe a thinking-only interrupt at all: the KV holds
+   bytes no remembered text covers.
+
+**The shape that satisfies both the prefix rule and the token gap:** remember a
+*partial* surface — prompt text plus reasoning-so-far, or plus content-so-far —
+and append no marker. The remembered text stays a byte prefix of the render the
+client sends next, and the tail it re-tokenizes begins with exactly the boundary
+and end-of-turn tokens the cancelled turn never evaluated. A partial carrying both
+reasoning and content would need the boundary marker between them to stay a
+prefix, and a partial that reached a tool call would need the call markup, so both
+keep the pre-fix clear. Remember what is provably a prefix; clear everything else.

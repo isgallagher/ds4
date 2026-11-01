@@ -210,6 +210,19 @@
 #       cancelled turn is unclosed by definition. Test:
 #       test_responses_cancel_release_live_partial (mutation-checked: breaking
 #       the surface-length assertion turns the suite red).
+#   0014-kv-keep-payload-on-cancelled-prefill.patch
+#       A cancelled prefill unlinked the disk payload it had just loaded. The
+#       sync fails because the client went away, not because the checkpoint is
+#       corrupt - but the failure path discarded the file either way, with a
+#       distinct reason label as the only difference. Observed 2026-11-01 10:16
+#       (owner's escape): 65,536-token hit from file 66b52486…, prefill
+#       cancelled, same file unlinked, next request could only resume at 30,985
+#       and re-prefilled 112,866 tokens (~5 min). Each interrupt made the cache
+#       permanently worse. Now: keep the payload, keep the session and schedule
+#       bookkeeping exactly as before (the live session is mid-sync, so it is
+#       still invalidated), and log "kv cache entry kept reason=cancelled-*".
+#       The forked-payload discard (0007/0012) is untouched - that payload IS
+#       wrong for the prompt and must go.
 #
 # ARCHIVE: patches/archive/0005-…superseded-by-pr-1206.patch — our FIX-1. The
 # visible-suffix gate change is replaced by #1206's two-key design, which also
@@ -308,6 +321,7 @@ apply patches/0010-kvstore-test-stub-payload-bytes.patch
 apply patches/0011-responses-cancel-remember-visible.patch
 apply patches/0012-kv-fork-next-shorter-candidate.patch
 apply patches/0013-responses-cancel-remember-partial-visible.patch
+apply patches/0014-kv-keep-payload-on-cancelled-prefill.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim

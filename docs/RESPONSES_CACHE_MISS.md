@@ -319,3 +319,52 @@ and end-of-turn tokens the cancelled turn never evaluated. A partial carrying bo
 reasoning and content would need the boundary marker between them to stay a
 prefix, and a partial that reached a tool call would need the call markup, so both
 keep the pre-fix clear. Remember what is provably a prefix; clear everything else.
+
+## 12. The interrupt that made the cache worse: a cancelled prefill deleted its own checkpoint (2026-11-01 10:16)
+
+**Owner report:** "I just interrupted you and send a new message" — and the log showed
+the conversation re-prefilling 73,651 tokens, then a second conversation re-prefilling
+112,866. Two mechanisms are visible in one window, and only the first one is the
+escape case §10–§11 already covers.
+
+**Mechanism A — the token-level re-render fork (known).**
+
+```
+10:16:20 slot 1: request reuses nothing; evicting checkpoint (139686 tokens, idle 32 s, protected)
+10:16:20 live kv cache miss RESPPROTO live=139686 prompt=139187 common=69119 vision=match reason=token-mismatch
+10:16:20 responses live checkpoint forks from client re-render ... common=69119; healing from canonical prompt
+10:16:22 kv cache hit text RESPPROTO tokens=65536 ... file=66b524869d4ce6623b4c1dab501e3802f22f5100.kv
+10:16:22 chat ctx=65536..139187:73651 ... prompt start
+```
+
+The resent prompt is **shorter** than the live frontier (139,187 vs 139,686) and diverges
+at 69,119 — the same token-level class §10's V1 capture proved is not a history rewrite.
+The visible tier cannot serve it, and 0013 cannot either: a handle whose frontier sits at
+139,686 is beyond a 139,187-token prompt. This is what 0012's next-shorter retry is for,
+and it worked — 65,536 recovered instead of prefilling from zero. Note also that a
+**protected** 139,686-token checkpoint was evicted to make room; that is the routing side
+of the same event, still parked.
+
+**Mechanism B — new, and the reason it kept getting worse.**
+
+```
+10:16:57 kv cache discarded reason=cancelled-during-prefill file=66b524869d4ce6623b4c1dab501e3802f22f5100.kv
+10:16:57 kv cache hit text RESPPROTO tokens=30985 ... key=responses-visible
+10:16:57 chat ctx=30985..143851:112866 ... prompt start
+```
+
+**The file named at 10:16:57 is the same file that served the 65,536-token hit at
+10:16:22.** The prefill was cancelled, `server_session_sync` returned non-zero, and the
+prefill-failure path discarded the disk entry as though the checkpoint had failed.
+Patch 0008 had given that branch an honest label — `cancelled-during-prefill` — but the
+label was the only thing that branched: the `unlink()` ran either way. One escape
+therefore destroyed 35k tokens of checkpoint, and the next request fell back to the
+30,985-token checkpoint and re-prefilled 112,866. Each interrupt made the store
+permanently worse than the last.
+
+**Fix (patch 0014, runbook B13).** Keep the payload when the sync failed because the
+client went away; keep every other part of the failure path unchanged, including the
+session invalidation, because a mid-sync session is genuinely not a usable frontier. The
+distinction is *who failed*: a forked payload is wrong for the prompt and must be deleted
+(0007/0012); a cancelled prefill is a client that left, and its checkpoint is the cheapest
+recovery for the resend that follows.

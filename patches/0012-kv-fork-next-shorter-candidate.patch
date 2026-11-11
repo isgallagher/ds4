@@ -1,0 +1,131 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index 0d21a10..98f0186 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -14252,55 +14252,79 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+         kv_cache_store_current(s, slot, "evict");
+     }
+     if (!multimodal && cached == 0) {
+-        disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
+-                                        &disk_cache_path,
+-                                        &disk_cache_ext_flags);
+-        if (disk_cached > 0) {
+-            /* Forked disk-load guard, visible keys only: the payload was
+-             * found by a text prefix, and a visible-keyed payload can carry
+-             * the era it was saved in, because hidden reasoning is not in its
+-             * key. Extending that payload would carry the fork forward: the
+-             * next turn misses at the same frozen point, re-loads the same
+-             * payload, and the desync persists. Verify the loaded tokens are
+-             * still a lockstep prefix of the client's canonical prompt; on a
+-             * fork, discard the payload and heal the checkpoint from the
+-             * client's prompt instead (prompt_for_sync stays the canonical
+-             * full prompt).
+-             * A token-text payload is not guarded. Its stored text was just
+-             * proven to be a byte prefix of this prompt, and the loader
+-             * rebuilds the prompt from the stored token history plus the
+-             * tokenized suffix, so ids legitimately differ wherever an
+-             * earlier splice set a boundary. Comparing ids against a fresh
+-             * tokenization of the whole prompt therefore rejects long spliced
+-             * checkpoints and accepts only short freshly tokenized ones -
+-             * the opposite of what recovery wants, and on a multi-session
+-             * server it repeats on every client switch, because no
+-             * conversation keeps the slot long enough to converge. */
+-            if (responses_fork_heal &&
+-                (disk_cache_ext_flags & (KV_EXT_RESPONSES_VISIBLE |
+-                                         KV_EXT_THINKING_VISIBLE))) {
+-                pthread_mutex_lock(&s->inference_mu);
+-                const int loaded_common =
+-                    ds4_session_common_prefix(slot->session, &j->req.prompt);
+-                pthread_mutex_unlock(&s->inference_mu);
+-                if (loaded_common < disk_cached) {
+-                    server_log(DS4_LOG_KVCACHE,
+-                               "ds4-server: responses disk checkpoint forks from client re-render RESPPROTO loaded=%d common=%d prompt=%d; discarding and healing from canonical prompt",
+-                               disk_cached, loaded_common, j->req.prompt.len);
+-                    kv_cache_discard_disk_entry(s, slot,
+-                                               disk_cache_path,
+-                                               "forked-payload");
+-                    free(disk_cache_path);
+-                    disk_cache_path = NULL;
+-                    ds4_tokens_free(&effective_prompt);
+-                    disk_cached = 0;
+-                }
+-            }
++        /* A forked visible-keyed payload no longer ends the disk tier.
++         * Discarding it stays (0007's protection: the forked text is a byte
++         * prefix of every later render of this conversation, so keeping it
++         * would re-seed the same reject on every turn), but the turn still
++         * gets the next-shorter candidate: the refresh inside the lookup
++         * rescans the store directory, so a discarded file is never offered
++         * again, and every candidate gets its own lockstep check.  A
++         * pre-fork ladder checkpoint is token-exact by construction and
++         * loads; the prompt then re-prefills from its frontier instead of
++         * from zero (observed 2026-10-31 19:48: a rejected 172,094-token
++         * payload sat above 65,536-token ladder checkpoints; accepting one
++         * would have cut a 229 s full prefill to roughly 154 s).  Bounded:
++         * every attempt either accepts a candidate or permanently discards
++         * one, and the loop stops at the attempt cap. */
++        const int disk_fork_attempts = 4;
++        for (int disk_attempt = 0;; disk_attempt++) {
++            disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
++                                            &disk_cache_path,
++                                            &disk_cache_ext_flags);
++            bool retry_shorter = false;
+             if (disk_cached > 0) {
+-                cached = disk_cached;
+-                cache_source = "disk-text";
+-                prompt_for_sync = &effective_prompt;
++                /* Forked disk-load guard, visible keys only: the payload was
++                 * found by a text prefix, and a visible-keyed payload can carry
++                 * the era it was saved in, because hidden reasoning is not in its
++                 * key. Extending that payload would carry the fork forward: the
++                 * next turn misses at the same frozen point, re-loads the same
++                 * payload, and the desync persists. Verify the loaded tokens are
++                 * still a lockstep prefix of the client's canonical prompt; on a
++                 * fork, discard the payload and heal the checkpoint from the
++                 * client's prompt instead (prompt_for_sync stays the canonical
++                 * full prompt).
++                 * A token-text payload is not guarded. Its stored text was just
++                 * proven to be a byte prefix of this prompt, and the loader
++                 * rebuilds the prompt from the stored token history plus the
++                 * tokenized suffix, so ids legitimately differ wherever an
++                 * earlier splice set a boundary. Comparing ids against a fresh
++                 * tokenization of the whole prompt therefore rejects long spliced
++                 * checkpoints and accepts only short freshly tokenized ones -
++                 * the opposite of what recovery wants, and on a multi-session
++                 * server it repeats on every client switch, because no
++                 * conversation keeps the slot long enough to converge. */
++                if (responses_fork_heal &&
++                    (disk_cache_ext_flags & (KV_EXT_RESPONSES_VISIBLE |
++                                             KV_EXT_THINKING_VISIBLE))) {
++                    pthread_mutex_lock(&s->inference_mu);
++                    const int loaded_common =
++                        ds4_session_common_prefix(slot->session, &j->req.prompt);
++                    pthread_mutex_unlock(&s->inference_mu);
++                    if (loaded_common < disk_cached) {
++                        const bool can_retry =
++                            disk_attempt + 1 < disk_fork_attempts;
++                        server_log(DS4_LOG_KVCACHE,
++                                   "ds4-server: responses disk checkpoint forks from client re-render RESPPROTO loaded=%d common=%d prompt=%d; discarding and %s",
++                                   disk_cached, loaded_common, j->req.prompt.len,
++                                   can_retry ? "trying next-shorter candidate"
++                                             : "healing from canonical prompt");
++                        kv_cache_discard_disk_entry(s, slot,
++                                                   disk_cache_path,
++                                                   "forked-payload");
++                        free(disk_cache_path);
++                        disk_cache_path = NULL;
++                        ds4_tokens_free(&effective_prompt);
++                        disk_cached = 0;
++                        retry_shorter = can_retry;
++                    }
++                }
++                if (disk_cached > 0) {
++                    cached = disk_cached;
++                    cache_source = "disk-text";
++                    prompt_for_sync = &effective_prompt;
++                }
+             }
++        if (!retry_shorter) break;
+         }
+     }
+     const bool responses_reasoning_state_preserved =

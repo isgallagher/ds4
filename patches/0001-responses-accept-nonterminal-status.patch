@@ -1,0 +1,97 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index 20fba30..a9a4d52 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -4694,6 +4694,8 @@ static bool parse_responses_content_array_multimodal(
+     return true;
+ }
+ 
++static void server_log(ds4_log_type type, const char *fmt, ...);
++
+ /* Codex /v1/responses input items have a `type` discriminator (message,
+  * function_call, function_call_output, reasoning, custom_tool_call,
+  * custom_tool_call_output, ...). We collapse them into chat_msgs the same way
+@@ -4913,32 +4915,21 @@ item_fail:
+         (*p)++;
+ 
+         const char *t = type ? type : "message";
+-        /* Replayed items must be in a terminal "completed" state. in_progress,
+-         * incomplete, and failed all represent partial model state the client
+-         * never confirmed — feeding them back as history would let DS4 continue
+-         * from a tool action that never finished. Reject explicitly. */
++        /* Non-terminal replayed status (in_progress / incomplete / failed)
++         * used to fail the whole request. ds4 itself emits those items
++         * (responses_sse_reasoning_done for reasoning, the message close
++         * paths on length/error finish) and must round-trip its own
++         * output, and dropping the item would orphan its paired tool
++         * output. Accept and clear the status; the content still replays
++         * (matching the intent below). */
+         if (status_str && status_str[0] &&
+             strcmp(status_str, "completed") != 0)
+         {
+-            free(type);
+-            free(role);
+-            free(content);
+-            free(name);
+-            free(namespace);
+-            free(call_id);
+-            free(item_id);
+-            free(arguments);
+-            free(output);
+-            free(input_str);
+-            free(summary);
+-            free(action);
+-            free(result);
+-            free(tools_json);
++            server_log(DS4_LOG_WARNING,
++                       "ds4-server: replayed %s item with non-terminal status %s; accepting",
++                       type ? type : "message", status_str);
+             free(status_str);
+-            server_image_inputs_free(&content_images);
+-            server_image_inputs_free(&output_images);
+-            buf_free(&pending_reasoning);
+-            return false;
++            status_str = NULL;
+         }
+         if ((content_images.len &&
+              (strcmp(t, "message") || (role && strcmp(role, "user")))) ||
+@@ -5144,30 +5135,15 @@ item_fail:
+             }
+             chat_msgs_push(msgs, msg);
+         } else if (!is_bookkeeping) {
+-            /* Anything we don't have an explicit branch for would silently
+-             * drop replay context. Fail the parse instead so the client sees
+-             * the limitation rather than ending up with stale generation
+-             * built on an incomplete history. Only compaction/context_compaction
+-             * (true Codex bookkeeping) are allowed to pass through silently. */
+-            free(type);
+-            free(role);
+-            free(content);
+-            free(name);
+-            free(namespace);
+-            free(call_id);
+-            free(item_id);
+-            free(arguments);
+-            free(output);
+-            free(input_str);
+-            free(summary);
+-            free(action);
+-            free(result);
+-            free(tools_json);
+-            free(status_str);
+-            server_image_inputs_free(&content_images);
+-            server_image_inputs_free(&output_images);
+-            buf_free(&pending_reasoning);
+-            return false;
++            /* Unknown item type: drop this one item with a warning and keep
++             * the session alive. Failing the whole replay for a single schema
++             * drift item is worse than losing that item's context; the common
++             * free tail below releases every local. Only compaction /
++             * context_compaction pass through silently (is_bookkeeping). */
++            server_log(DS4_LOG_WARNING,
++                       "ds4-server: dropping unknown replayed item type %s id=%s",
++                       type ? type : "(none)",
++                       item_id ? item_id : "(none)");
+         }
+ 
+         free(type);

@@ -1,0 +1,73 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index 6fe4e45..a0fa16c 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -11755,18 +11755,26 @@ static void kv_cache_slot_restore_suppressed(server_slot *slot,
+     }
+ }
+ 
+-static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
+-                                                const char *path) {
++/* Drop a disk payload this request could not use, with the live state loaded
++ * from it.  The reason names the decision site, because the sites mean
++ * different things to an operator: a forked payload is a deliberate policy
++ * discard of a checkpoint that is still valid for its own owner, a sync
++ * failure is an engine error, and a cancelled job is a client that stopped
++ * reading.  One label for all three made a cancelled turn read like cache
++ * corruption. */
++static void kv_cache_discard_disk_entry(server *s, server_slot *slot,
++                                        const char *path,
++                                        const char *reason) {
+     if (!s || !slot || !path) return;
+     pthread_mutex_lock(&s->kv_mu);
+     if (unlink(path) == 0) {
+         server_log(DS4_LOG_KVCACHE,
+-                   "ds4-server: kv cache discarded reason=prefill-failed file=%s",
+-                   path);
++                   "ds4-server: kv cache discarded reason=%s file=%s",
++                   reason, path);
+     } else if (errno != ENOENT) {
+         server_log(DS4_LOG_WARNING,
+-                   "ds4-server: kv cache failed to discard prefill-failed file=%s: %s",
+-                   path, strerror(errno));
++                   "ds4-server: kv cache failed to discard entry (%s) file=%s: %s",
++                   reason, path, strerror(errno));
+     }
+     pthread_mutex_unlock(&s->kv_mu);
+     slot->continued_last_store_tokens = 0;
+@@ -14232,8 +14240,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+                     server_log(DS4_LOG_KVCACHE,
+                                "ds4-server: responses disk checkpoint forks from client re-render RESPPROTO loaded=%d common=%d prompt=%d; discarding and healing from canonical prompt",
+                                disk_cached, loaded_common, j->req.prompt.len);
+-                    kv_cache_discard_failed_disk_entry(s, slot,
+-                                                       disk_cache_path);
++                    kv_cache_discard_disk_entry(s, slot,
++                                               disk_cache_path,
++                                               "forked-payload");
+                     free(disk_cache_path);
+                     disk_cache_path = NULL;
+                     ds4_tokens_free(&effective_prompt);
+@@ -14371,7 +14380,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+             ds4_session_set_display_progress(slot->session, NULL, NULL);
+             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
+                                              cold_store_len);
+-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
++            kv_cache_discard_disk_entry(s, slot, disk_cache_path,
++                                        job_cancelled(j)
++                                        ? "cancelled-during-cold-prefix"
++                                        : "cold-prefix-sync-failed");
+             free(disk_cache_path);
+             if (job_cancelled(j)) {
+                 request_live_state_clear(s, slot);
+@@ -14406,7 +14418,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+         ds4_session_set_display_progress(slot->session, NULL, NULL);
+         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
+                                          cold_store_len);
+-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
++        kv_cache_discard_disk_entry(s, slot, disk_cache_path,
++                                    job_cancelled(j)
++                                    ? "cancelled-during-prefill"
++                                    : "prompt-sync-failed");
+         free(disk_cache_path);
+         if (job_cancelled(j)) {
+             request_live_state_clear(s, slot);

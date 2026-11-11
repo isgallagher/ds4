@@ -1,0 +1,75 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index f3234e0..ac710c8 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -12803,8 +12803,14 @@ static char *build_responses_visible_assistant_suffix(const request *r,
+     const server_model_syntax syntax =
+         r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
+     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
++        /* pi 1.0.4 replays the reasoning item for final answers too, and the
++         * next render places it inside the think block; the recorded suffix
++         * must carry it whenever we handed reasoning to the client.  Gating
++         * on calls>0 omitted it for no-tool-call turns, the byte prefix
++         * failed, and a tokenization-drift fork became a full re-prefill
++         * (2026-10-09 request 9; 2026-10-10 20:39:44 common=168055). */
+         return build_qwen_assistant_suffix(r, content, reasoning,
+-                                           r && r->reasoning_summary_emit && calls && calls->len > 0, calls);
++                                           r && r->reasoning_summary_emit, calls);
+     }
+     buf suffix = {0};
+     /* This suffix mirrors what a Responses client can replay, not necessarily
+@@ -20443,6 +20449,46 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
+     request_free(&r);
+ }
+ 
++/* A replayed final answer carries its reasoning (pi 1.0.4), so the recorded
++ * Responses-visible suffix for a no-tool-call Qwen turn must include it.  The
++ * expectation is built from the Qwen suffix builder itself, never from
++ * template literals. */
++static void test_qwen_visible_suffix_carries_final_answer_reasoning(void) {
++    request r;
++    request_init(&r, REQ_CHAT, 128);
++    r.api = API_RESPONSES;
++    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
++    r.think_mode = DS4_THINK_HIGH;
++    r.reasoning_summary_emit = true;
++
++    char *suffix = build_responses_visible_assistant_suffix(&r, "5",
++                                                            "hidden summary",
++                                                            NULL);
++    char *want = build_qwen_assistant_suffix(&r, "5", "hidden summary",
++                                             true, NULL);
++    TEST_ASSERT(suffix && want && strcmp(suffix, want) == 0);
++    TEST_ASSERT(suffix && strstr(suffix, "hidden summary") != NULL);
++
++    /* The tier's real condition: the recorded suffix is a byte substring of
++     * the render the next request produces for the replayed turn. */
++    chat_msg am = {0};
++    am.role = xstrdup("assistant");
++    am.content = xstrdup("5");
++    am.reasoning = xstrdup("hidden summary");
++    buf rendered = {0};
++    append_qwen_assistant_message(&rendered, &am, NULL);
++    TEST_ASSERT(rendered.ptr && suffix &&
++                strstr(rendered.ptr, suffix) != NULL);
++
++    buf_free(&rendered);
++    free(am.role);
++    free(am.content);
++    free(am.reasoning);
++    free(suffix);
++    free(want);
++    request_free(&r);
++}
++
+ static void test_exact_dsml_tool_replay_can_be_disabled(void) {
+     const char *dsml =
+         "\n\n<｜DSML｜tool_calls>\n"
+@@ -23065,6 +23111,7 @@ static void ds4_server_unit_tests_run(void) {
+     test_responses_tool_output_id_validation();
+     test_responses_stateless_tool_replay_requires_reasoning();
+     test_responses_visible_suffix_matches_client_replay();
++    test_qwen_visible_suffix_carries_final_answer_reasoning();
+     test_exact_dsml_tool_replay_can_be_disabled();
+     test_dsml_decode_state_separates_structure_and_payload();
+     test_decode_tracker_split_parameter_close();

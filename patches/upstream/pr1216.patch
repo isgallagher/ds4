@@ -1,0 +1,126 @@
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index d9d3311..f988ebc 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -1193,28 +1193,61 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
+     return false;
+ }
+ 
++typedef struct {
++    uint64_t bytes;
++    int idx;
++} kv_text_candidate;
++
++static int kv_text_candidate_cmp(const void *a, const void *b) {
++    const kv_text_candidate *x = a, *y = b;
++    if (x->bytes != y->bytes) return x->bytes < y->bytes ? -1 : 1;
++    return x->idx - y->idx;
++}
++
++/* Find the entry whose text is the longest prefix of prompt_text (more tokens
++ * on ties, then the earlier entry).  Candidates are hashed in order of text
++ * length with one running SHA-1, finalizing a copy at each length, so the
++ * prompt is read once however many checkpoints the directory holds. */
+ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                  int model_id, int quant_bits, int ctx_size) {
+     if (!prompt_text) return -1;
+     const size_t prompt_bytes = strlen(prompt_text);
+     kv_cache_refresh(kc);
+-    int best = -1;
++    kv_text_candidate *cand = kv_xmalloc((size_t)(kc->len ? kc->len : 1) * sizeof(cand[0]));
++    int n = 0;
+     for (int i = 0; i < kc->len; i++) {
+         ds4_kvstore_entry *e = &kc->entry[i];
+-        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
++        if (e->text_bytes > prompt_bytes) continue;
+         if ((int)e->tokens < kc->opt.min_tokens) continue;
+         if (e->model_id != (uint8_t)model_id) continue;
+         if ((uint32_t)ctx_size < e->ctx_size) continue;
+         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+-        if (best >= 0) {
+-            ds4_kvstore_entry *b = &kc->entry[best];
+-            if (e->text_bytes < b->text_bytes) continue;
+-            if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
++        cand[n++] = (kv_text_candidate){ e->text_bytes, i };
++    }
++    qsort(cand, (size_t)n, sizeof(cand[0]), kv_text_candidate_cmp);
++
++    int best = -1;
++    sha1_ctx running;
++    sha1_init(&running);
++    uint64_t hashed = 0;
++    char sha[41] = {0};
++    for (int k = 0; k < n; k++) {
++        const ds4_kvstore_entry *e = &kc->entry[cand[k].idx];
++        if (k == 0 || cand[k].bytes != hashed) {
++            sha1_update(&running, prompt_text + hashed, (size_t)(cand[k].bytes - hashed));
++            hashed = cand[k].bytes;
++            sha1_ctx done = running;
++            uint8_t digest[20];
++            sha1_final(&done, digest);
++            hex20(digest, sha);
+         }
+-        char sha[41];
+-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+-        if (!strcmp(sha, e->sha)) best = i;
++        if (strcmp(sha, e->sha)) continue;
++        /* Ascending length order: a match is at least as long as best. */
++        if (best >= 0 && e->text_bytes == kc->entry[best].text_bytes &&
++            e->tokens <= kc->entry[best].tokens) continue;
++        best = cand[k].idx;
+     }
++    free(cand);
+     return best;
+ }
+ 
+diff --git a/ds4_server.c b/ds4_server.c
+index 20fba30..868c82f 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -21695,8 +21695,14 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
+ 
+     const char *short_text = "transcript prefix";
+     const char *long_text = "transcript prefix with sampled token bytes";
++    /* Longer than the match but not a prefix, and a match in between: the
++     * single running hash must finalize correctly at every length. */
++    const char *other_text = "transcript prefix with sampled token bytes and another tail";
++    const char *mid_text = "transcript prefix with";
+     test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512, 0);
+     test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768, 0);
++    test_kv_text_stub_file(dir, other_text, KV_REASON_COLD, 900, 0);
++    test_kv_text_stub_file(dir, mid_text, KV_REASON_COLD, 600, 0);
+ 
+     kv_disk_cache kc = {0};
+     kc.enabled = true;
+@@ -21710,20 +21716,19 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
+     TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 768);
+     TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(long_text));
+     TEST_ASSERT(kv_cache_find_text_prefix(&kc, "transcript prefiX", 2, 32768) < 0);
++    idx = kv_cache_find_text_prefix(&kc, "transcript prefix with sampled", 2, 32768);
++    TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == strlen(mid_text));
+ 
+     kv_cache_close(&kc);
+-    char short_sha[41], long_sha[41];
+-    sha1_bytes_hex(short_text, strlen(short_text), short_sha);
+-    sha1_bytes_hex(long_text, strlen(long_text), long_sha);
+-    char short_name[44], long_name[44];
+-    snprintf(short_name, sizeof(short_name), "%.40s.kv", short_sha);
+-    snprintf(long_name, sizeof(long_name), "%.40s.kv", long_sha);
+-    char *short_path = path_join(dir, short_name);
+-    char *long_path = path_join(dir, long_name);
+-    unlink(short_path);
+-    unlink(long_path);
+-    free(short_path);
+-    free(long_path);
++    const char *texts[] = {short_text, long_text, other_text, mid_text};
++    for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); i++) {
++        char sha[41], name[44];
++        sha1_bytes_hex(texts[i], strlen(texts[i]), sha);
++        snprintf(name, sizeof(name), "%.40s.kv", sha);
++        char *path = path_join(dir, name);
++        unlink(path);
++        free(path);
++    }
+     rmdir(dir);
+ }
+ 

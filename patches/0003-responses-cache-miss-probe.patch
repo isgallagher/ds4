@@ -1,0 +1,98 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index 93afcd1..14e1a8b 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -9831,6 +9831,39 @@ static double now_sec(void) {
+     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+ }
+ 
++/* Small local base64 encoder for diagnostic dumps. Bounds the output to
++ * outsz (NUL included); returns the number of base64 chars written (excluding
++ * the NUL). Used only by the env-gated cache-miss token window so that raw
++ * special-token bytes from the tokenizer never reach the log stream. */
++static int server_b64_encode(const unsigned char *in, size_t in_len, char *out, size_t outsz) {
++    static const char tab[] =
++        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    if (out == NULL || outsz == 0) return 0;
++    size_t o = 0;
++    size_t i = 0;
++    while (i + 3 <= in_len && o + 5 < outsz) {
++        out[o++] = tab[in[i] >> 2];
++        out[o++] = tab[((in[i] << 4) | (in[i + 1] >> 4)) & 0x3F];
++        out[o++] = tab[((in[i + 1] << 2) | (in[i + 2] >> 6)) & 0x3F];
++        out[o++] = tab[in[i + 2] & 0x3F];
++        i += 3;
++    }
++    int rem = (int)(in_len - i);
++    if (rem == 1 && o + 4 <= outsz) {
++        out[o++] = tab[in[i] >> 2];
++        out[o++] = tab[(in[i] & 0x03) << 4];
++        out[o++] = '=';
++        out[o++] = '=';
++    } else if (rem == 2 && o + 4 <= outsz) {
++        out[o++] = tab[in[i] >> 2];
++        out[o++] = tab[((in[i] & 0x03) << 4) | (in[i + 1] >> 4)];
++        out[o++] = tab[(in[i + 1] & 0x0F) << 2];
++        out[o++] = '=';
++    }
++    out[o] = '\0';
++    return (int)o;
++}
++
+ static pthread_mutex_t server_log_mu = PTHREAD_MUTEX_INITIALIZER;
+ 
+ static void server_log(ds4_log_type type, const char *fmt, ...) {
+@@ -13560,6 +13593,53 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+                    old_pos, j->req.prompt.len, common,
+                    live_vision_match ? "match" : "mismatch",
+                    trace_cache_miss_reason(&cache_diag));
++        /* Diagnostic (env-gated, DS4_CACHE_MISS_DEBUG=1): dump a token window
++         * around the first live/prompt divergence as base64 plus raw token ids,
++         * so the mismatch can be read without re-deriving it. The live KV is
++         * only observable from inside the server, so this is the offline-safe
++         * way to name the item at the divergence point. Base64 keeps any
++         * special-token bytes out of the log stream as raw tokens. */
++        if (getenv("DS4_CACHE_MISS_DEBUG") != NULL) {
++            const ds4_tokens *live_toks = ds4_session_tokens(slot->session);
++            const ds4_tokens *prompt_toks = &j->req.prompt;
++            const int live_len = live_toks ? live_toks->len : 0;
++            const int prompt_len = prompt_toks ? prompt_toks->len : 0;
++            const int w = 32;
++            int s0 = common - w;
++            if (s0 < 0) s0 = 0;
++            int e0 = common + w + 1;
++            if (e0 > live_len && e0 > prompt_len) e0 = (live_len > prompt_len ? live_len : prompt_len);
++            server_log(DS4_LOG_WARNING,
++                       "ds4-server: CACHEMISS_DEBUG first_diff=%d window=[%d..%d) live_len=%d prompt_len=%d",
++                       common, s0, e0, live_len, prompt_len);
++            for (int pos = s0; pos < e0; pos++) {
++                const int lv = (live_toks && pos < live_len) ? live_toks->v[pos] : -1;
++                const int pv = (prompt_toks && pos < prompt_len) ? prompt_toks->v[pos] : -1;
++                char lb[2048] = "<absent>";
++                char pb[2048] = "<absent>";
++                if (lv >= 0) {
++                    size_t lnb = 0;
++                    char *lt = ds4_token_text(s->engine, lv, &lnb);
++                    if (lt) {
++                        int n = server_b64_encode(lt, lnb, lb, sizeof(lb));
++                        (void)n;
++                        free(lt);
++                    }
++                }
++                if (pv >= 0) {
++                    size_t pnb = 0;
++                    char *pt = ds4_token_text(s->engine, pv, &pnb);
++                    if (pt) {
++                        int n = server_b64_encode(pt, pnb, pb, sizeof(pb));
++                        (void)n;
++                        free(pt);
++                    }
++                }
++                server_log(DS4_LOG_WARNING,
++                           "ds4-server: CACHEMISS_DEBUG pos=%d live=%d prompt=%d match=%s live64=%s prompt64=%s",
++                           pos, lv, pv, (lv == pv) ? "==" : "!=", lb, pb);
++            }
++        }
+     }
+     if (multimodal && cached > 0) {
+         server_log(DS4_LOG_KVCACHE,

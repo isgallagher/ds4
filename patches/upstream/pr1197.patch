@@ -1,0 +1,212 @@
+diff --git a/Makefile b/Makefile
+index c0ef50b..6fe3877 100644
+--- a/Makefile
++++ b/Makefile
+@@ -25,7 +25,7 @@ DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
+ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
+ 
+ ifeq ($(UNAME_S),Darwin)
+-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
++METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework ImageIO -framework CoreGraphics -framework CoreFoundation
+ CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
+ CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+ else
+diff --git a/ds4_image.c b/ds4_image.c
+index c3ed330..cdd0476 100644
+--- a/ds4_image.c
++++ b/ds4_image.c
+@@ -12,6 +12,12 @@
+ #include "third_party/iris/jpeg.h"
+ #include "third_party/iris/png.h"
+ 
++#ifdef __APPLE__
++#include <CoreFoundation/CoreFoundation.h>
++#include <CoreGraphics/CoreGraphics.h>
++#include <ImageIO/ImageIO.h>
++#endif
++
+ typedef struct {
+     uint32_t state[8];
+     uint64_t bytes;
+@@ -231,6 +237,67 @@ static int ds4_oriented_rgb(
+     return 1;
+ }
+ 
++/* Pasted screenshots and clipboard images frequently arrive as WebP. macOS
++ * ImageIO decodes it with no new dependency: draw into RGBA8, premultiplied,
++ * over white so transparent pixels match what a JPEG viewer would show, then
++ * reuse the shared oriented-RGB path. */
++#ifdef __APPLE__
++static int ds4_decode_webp_imageio(
++        ds4_image *out,
++        const uint8_t *encoded,
++        size_t encoded_len,
++        char *error,
++        size_t error_cap) {
++    int ok = 0;
++    CFDataRef data = NULL;
++    CGImageSourceRef source = NULL;
++    CGImageRef image = NULL;
++    CGContextRef context = NULL;
++    data = CFDataCreate(NULL, encoded, (CFIndex)encoded_len);
++    if (data) source = CGImageSourceCreateWithData(data, NULL);
++    if (source) image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
++    if (!image) {
++        ds4_image_error(error, error_cap, "invalid or unsupported WebP image");
++        goto webp_done;
++    }
++    size_t width = CGImageGetWidth(image);
++    size_t height = CGImageGetHeight(image);
++    if (width == 0 || height == 0 ||
++        width > DS4_IMAGE_MAX_DIMENSION || height > DS4_IMAGE_MAX_DIMENSION ||
++        width * height > DS4_IMAGE_MAX_PIXELS) {
++        ds4_image_error(error, error_cap, "WebP image exceeds the decoded image limits");
++        goto webp_done;
++    }
++    context = CGBitmapContextCreate(NULL, width, height, 8, 0,
++                                    CGColorSpaceCreateDeviceRGB(),
++                                    (CGBitmapInfo)(kCGImageAlphaPremultipliedLast |
++                                                   kCGBitmapByteOrder32Big));
++    if (!context) {
++        ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
++        goto webp_done;
++    }
++    CGContextSetRGBFillColor(context, 1.0, 1.0, 1.0, 1.0);
++    CGContextFillRect(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height));
++    /* A plain draw already lands the image top row in buffer row 0: the
++     * context stores top-down memory, so the classic Cocoa flip idiom here
++     * would invert the picture. Verified pixel-exact against the PNG path. */
++    CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
++    const uint8_t *pixels = (const uint8_t *)CGBitmapContextGetData(context);
++    if (!pixels) {
++        ds4_image_error(error, error_cap, "unable to read decoded WebP pixels");
++        goto webp_done;
++    }
++    ok = ds4_oriented_rgb(out, pixels, (uint32_t)width, (uint32_t)height, 4, 1);
++    if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
++webp_done:
++    if (context) CFRelease(context);
++    if (image) CFRelease(image);
++    if (source) CFRelease(source);
++    if (data) CFRelease(data);
++    return ok;
++}
++#endif
++
+ int ds4_image_decode_memory(
+         ds4_image *out,
+         const uint8_t *encoded,
+@@ -275,6 +342,17 @@ int ds4_image_decode_memory(
+         return ok;
+     }
+ 
++    if (encoded_len >= 12 &&
++        memcmp(encoded, "RIFF", 4) == 0 &&
++        memcmp(encoded + 8, "WEBP", 4) == 0) {
++#ifdef __APPLE__
++        return ds4_decode_webp_imageio(out, encoded, encoded_len, error, error_cap);
++#else
++        ds4_image_error(error, error_cap, "WebP images require the macOS ImageIO decoder");
++        return 0;
++#endif
++    }
++
+     ds4_image_error(error, error_cap, "image must be JPEG or PNG");
+     return 0;
+ }
+diff --git a/ds4_server.c b/ds4_server.c
+index b88aa44..815794a 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -3,6 +3,7 @@
+ #include "ds4_distributed.h"
+ #include "ds4_gpu_args.h"
+ #include "ds4_help.h"
++#include "ds4_image.h"
+ #include "ds4_kvstore.h"
+ #include "ds4_tp.h"
+ #include "rax.h"
+@@ -499,7 +500,8 @@ static bool server_image_media_type(const char *media_type) {
+     return media_type &&
+            (!strcasecmp(media_type, "image/png") ||
+             !strcasecmp(media_type, "image/jpeg") ||
+-            !strcasecmp(media_type, "image/jpg"));
++            !strcasecmp(media_type, "image/jpg") ||
++            !strcasecmp(media_type, "image/webp"));
+ }
+ 
+ static bool server_image_inputs_push_base64(server_image_inputs *images,
+@@ -543,6 +545,7 @@ static bool server_image_inputs_push_data_uri(
+     static const char png[] = "data:image/png;base64,";
+     static const char jpeg[] = "data:image/jpeg;base64,";
+     static const char jpg[] = "data:image/jpg;base64,";
++    static const char webp[] = "data:image/webp;base64,";
+     if (!uri) return false;
+     if (!strncmp(uri, png, sizeof(png) - 1))
+         return server_image_inputs_push_base64(
+@@ -553,6 +556,9 @@ static bool server_image_inputs_push_data_uri(
+     if (!strncmp(uri, jpg, sizeof(jpg) - 1))
+         return server_image_inputs_push_base64(
+             images, "image/jpg", uri + sizeof(jpg) - 1, marker);
++    if (!strncmp(uri, webp, sizeof(webp) - 1))
++        return server_image_inputs_push_base64(
++            images, "image/webp", uri + sizeof(webp) - 1, marker);
+     return false;
+ }
+ 
+@@ -22606,6 +22612,47 @@ static void test_responses_inline_image_content(void) {
+     buf_free(&json);
+ }
+ 
++/* A 32x32 lossless WebP gradient, red on the top row and blue on the bottom
++ * row: inline like the PNG fixture, and sensitive to a vertical inversion. */
++static const char test_inline_webp_base64[] =
++    "UklGRjIAAABXRUJQVlA4TCUAAAAvH8AHAM1VIKL/sYuI/geEBITo/2tZOf6/kCAh+n+tMZJ0RXsDAA==";
++
++static void test_openai_inline_webp_image_content(void) {
++    buf json = {0};
++    buf_puts(&json,
++        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"describe \"},"
++        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/webp;base64,");
++    buf_puts(&json, test_inline_webp_base64);
++    buf_puts(&json, "\"}}]}]");
++    const char *p = json.ptr;
++    chat_msgs msgs = {0};
++    TEST_ASSERT(parse_messages(&p, &msgs));
++    TEST_ASSERT(msgs.len == 1);
++    TEST_ASSERT(msgs.v[0].images.len == 1);
++    TEST_ASSERT(strstr(msgs.v[0].content, "describe ") == msgs.v[0].content);
++    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 12);
++    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "RIFF", 4));
++    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded + 8, "WEBP", 4));
++#ifdef __APPLE__
++    /* The ImageIO decoder must turn the fixture into the RGB pixels that the
++     * vision encoder consumes, in the right orientation: buffer row 0 is the
++     * gradient's red top, the last row is its blue bottom. */
++    ds4_image img = {0};
++    char err[128] = {0};
++    TEST_ASSERT(ds4_image_decode_memory(&img, msgs.v[0].images.v[0].encoded,
++                                        msgs.v[0].images.v[0].encoded_len,
++                                        err, sizeof(err)));
++    TEST_ASSERT(img.width == 32 && img.height == 32);
++    const unsigned char *top = img.rgb;
++    const unsigned char *bottom = img.rgb + (size_t)(img.height - 1) * img.width * 3;
++    TEST_ASSERT(top[0] > 200 && top[2] < 60);
++    TEST_ASSERT(bottom[2] > 200 && bottom[0] < 60);
++    ds4_image_free(&img);
++#endif
++    chat_msgs_free(&msgs);
++    buf_free(&json);
++}
++
+ static void test_visible_image_key(void) {
+     char markers[2][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A", "nonce_B"};
+     request req = {.image_count = 1, .image_markers = markers};
+@@ -23055,6 +23102,7 @@ static void ds4_server_unit_tests_run(void) {
+     test_http_image_paths_and_urls_are_rejected();
+     test_anthropic_inline_image_content();
+     test_responses_inline_image_content();
++    test_openai_inline_webp_image_content();
+     test_tool_separator_whitespace_is_not_content();
+     test_dsml_prompt_escapes_tool_supplied_text();
+     test_stop_list_parses_all_sequences();

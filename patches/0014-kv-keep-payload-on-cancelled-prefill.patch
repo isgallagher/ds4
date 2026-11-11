@@ -1,0 +1,80 @@
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -11799,6 +11799,31 @@
+     pthread_mutex_unlock(&s->inference_mu);
+ }
+ 
++/* A cancelled prefill is not a corrupt checkpoint.  The sync failed because the
++ * client went away, so the payload on disk is still byte-valid and is the
++ * cheapest recovery available to the next request -- which is often the resend
++ * that follows the very same interrupt.  Keep the payload, but run the session
++ * and schedule bookkeeping exactly as the failure path does today: the live
++ * session is mid-sync and must not be treated as a usable frontier.  Observed
++ * 2026-11-01 10:16: the file that had just served a 65,536-token hit was
++ * unlinked after a cancelled prefill, so the next request could only resume at
++ * 30,985 tokens and re-prefilled 112,866 (~5 min).  Every interrupt made the
++ * cache permanently worse, which is the escalation this function exists to stop. */
++static void kv_cache_keep_disk_entry(server *s, server_slot *slot,
++                                     const char *path, const char *reason) {
++    if (!s || !slot) return;
++    if (path)
++        server_log(DS4_LOG_KVCACHE,
++                   "ds4-server: kv cache entry kept reason=%s file=%s",
++                   reason, path);
++    slot->continued_last_store_tokens = 0;
++    if (slot->session) {
++        pthread_mutex_lock(&s->inference_mu);
++        ds4_session_invalidate(slot->session);
++        pthread_mutex_unlock(&s->inference_mu);
++    }
++}
++
+ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+     if (!s || !slot) return;
+     kv_disk_cache *kc = &s->kv;
+@@ -14524,16 +14549,17 @@
+             ds4_session_set_display_progress(slot->session, NULL, NULL);
+             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
+                                              cold_store_len);
+-            kv_cache_discard_disk_entry(s, slot, disk_cache_path,
+-                                        job_cancelled(j)
+-                                        ? "cancelled-during-cold-prefix"
+-                                        : "cold-prefix-sync-failed");
+-            free(disk_cache_path);
+             if (job_cancelled(j)) {
++                kv_cache_keep_disk_entry(s, slot, disk_cache_path,
++                                         "cancelled-during-cold-prefix");
++                free(disk_cache_path);
+                 request_live_state_clear(s, slot);
+                 trace_event(s, trace_id, "cancelled during prefill");
+                 return;
+             }
++            kv_cache_discard_disk_entry(s, slot, disk_cache_path,
++                                        "cold-prefix-sync-failed");
++            free(disk_cache_path);
+             trace_event(s, trace_id, "prefill failed: %s", err);
+             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+             return;
+@@ -14562,16 +14588,17 @@
+         ds4_session_set_display_progress(slot->session, NULL, NULL);
+         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
+                                          cold_store_len);
+-        kv_cache_discard_disk_entry(s, slot, disk_cache_path,
+-                                    job_cancelled(j)
+-                                    ? "cancelled-during-prefill"
+-                                    : "prompt-sync-failed");
+-        free(disk_cache_path);
+         if (job_cancelled(j)) {
++            kv_cache_keep_disk_entry(s, slot, disk_cache_path,
++                                     "cancelled-during-prefill");
++            free(disk_cache_path);
+             request_live_state_clear(s, slot);
+             trace_event(s, trace_id, "cancelled during prefill");
+             return;
+         }
++        kv_cache_discard_disk_entry(s, slot, disk_cache_path,
++                                    "prompt-sync-failed");
++        free(disk_cache_path);
+         trace_event(s, trace_id, "prefill failed: %s", err);
+         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+         return;

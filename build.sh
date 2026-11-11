@@ -389,4 +389,4 @@ codesign --force -s - ./ds4-server
 N_UP=$(grep -c '^apply patches/upstream/' "$0" || true)
 N_LOCAL=$(grep -c '^apply patches/0' "$0" || true)
 echo "done: ./ds4-server built from upstream ${FRESH} + ${N_UP} upstream PR patches + ${N_LOCAL} local patches"
-echo "run:  ./start-qwen38-longctx.sh   (runbook: docs/BUILD_PATCHES.md)"
+echo "run:  ./start-qwen38-batched.sh   (runbook: docs/BUILD_PATCHES.md)"

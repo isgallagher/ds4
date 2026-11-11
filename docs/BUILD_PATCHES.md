@@ -104,7 +104,7 @@ tracker order does not contain them both.
 | Our patches | `patches/` | `0001`…`0004`, `0006`…`0014` (0005 is archived), numbered; next is `0015` |
 | Archived patch | `patches/archive/` | kept for the record, never applied |
 | Upstream repo | `origin` = `git@github.com:antirez/ds4` (SSH — unusable on this box, see §Fetch) | upstream branch is **`main`**, not `master` |
-| Fix branch | `fix/responses-replay-status-tolerance` (fork `isgallagher/ds4`) | carries `build.sh` + `patches/` + docs; **pushed** to the fork (rebased onto `b3f5018`); kept as record/fallback |
+| Fix branch | `fix/responses-replay-status-tolerance` (**local only** — removed from the fork 2026-11-11: its commit metadata carried machine-default emails and the fork is public) | carries `build.sh` + `patches/` + docs; the local branch is the record/fallback; never push it again |
 | **Live contract branch** | `contract/b3f5018` (fork `isgallagher/ds4`) | the same artifacts re-landed fresh on `b3f5018` (a fresh branch, never a history replay); the running server builds from this branch |
 | PR branch (clean artifact) | `pr/responses-fork-heal` (fork `isgallagher/ds4`, PR #1194) | single code commit only. **Never** put `build.sh`/`patches/`/private docs on it |
 | Running server | `pgrep -f "ds4-server --ctx"` | one server at a time on this box |

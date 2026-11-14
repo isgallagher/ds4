@@ -1,0 +1,899 @@
+diff --git a/ds4.c b/ds4.c
+index 5c2f453..7d82145 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -78542,6 +78542,67 @@ bool ds4_session_checkpoint_image_span(const ds4_session *s, size_t i,
+     return true;
+ }
+ 
++/* Identity of the images that condition the session's KV *right now*: the
++ * in-flight sync set while a sync is running (the checkpoint set is not yet
++ * rewritten), the checkpoint set otherwise.  A disk store must describe what
++ * the payload actually contains, and during a prefill progress callback the
++ * checkpoint set is the previous turn's. */
++size_t ds4_session_active_image_count(const ds4_session *s) {
++    if (!s) return 0;
++    if (s->sync_images) return s->sync_image_count;
++    return s->checkpoint_valid ? s->checkpoint_image_count : 0;
++}
++
++bool ds4_session_active_image_identity(const ds4_session *s, size_t i,
++                                       uint32_t *token_start,
++                                       uint32_t *token_count,
++                                       uint8_t fingerprint[32]) {
++    if (!s) return false;
++    if (s->sync_images) {
++        if (i >= s->sync_image_count) return false;
++        const ds4_vision_span *sp = &s->sync_images[i];
++        if (token_start) *token_start = sp->token_start;
++        if (token_count) *token_count = sp->embedding.token_count;
++        if (fingerprint)
++            memcpy(fingerprint, sp->embedding.fingerprint,
++                   sizeof(sp->embedding.fingerprint));
++        return true;
++    }
++    if (!s->checkpoint_valid || i >= s->checkpoint_image_count) return false;
++    if (token_start) *token_start = s->checkpoint_images[i].token_start;
++    if (token_count) *token_count = s->checkpoint_images[i].token_count;
++    if (fingerprint)
++        memcpy(fingerprint, s->checkpoint_images[i].fingerprint,
++               sizeof(s->checkpoint_images[i].fingerprint));
++    return true;
++}
++
++/* Adopt an externally authenticated image identity as the session's vision
++ * state, without touching the KV or the tokens.  Used when a disk checkpoint
++ * is restored: the payload carries image-conditioned rows whose pixels are
++ * named by the checkpoint file, not by the payload, and the next sync must be
++ * able to check them.  Never called while a sync is in flight. */
++void ds4_session_set_vision_identity(ds4_session *s,
++                                     const ds4_vision_span *images,
++                                     size_t image_count) {
++    if (!s || (image_count != 0 && !images)) return;
++    ds4_vision_identity *copy = NULL;
++    if (image_count != 0) {
++        if (image_count > SIZE_MAX / sizeof(copy[0])) return;
++        copy = calloc(image_count, sizeof(copy[0]));
++        if (!copy) return;
++        for (size_t i = 0; i < image_count; i++) {
++            copy[i].token_start = images[i].token_start;
++            copy[i].token_count = images[i].embedding.token_count;
++            memcpy(copy[i].fingerprint, images[i].embedding.fingerprint,
++                   sizeof(copy[i].fingerprint));
++        }
++    }
++    free(s->checkpoint_images);
++    s->checkpoint_images = copy;
++    s->checkpoint_image_count = image_count;
++}
++
+ static bool ds4_session_vision_range_overlaps(
+         const ds4_session *s,
+         uint32_t           token_start,
+diff --git a/ds4.h b/ds4.h
+index 060364b..d765600 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -479,6 +479,22 @@ size_t ds4_session_checkpoint_image_count(const ds4_session *s);
+ bool ds4_session_checkpoint_image_span(const ds4_session *s, size_t i,
+                                        uint32_t *token_start,
+                                        uint32_t *token_count);
++/* Identity of the images that condition the session's KV right now: the
++ * in-flight sync set while a sync runs, the checkpoint set otherwise.  A disk
++ * store written from a prefill progress callback must describe the payload it
++ * is writing, not the previous turn's checkpoint. */
++size_t ds4_session_active_image_count(const ds4_session *s);
++bool ds4_session_active_image_identity(const ds4_session *s, size_t i,
++                                       uint32_t *token_start,
++                                       uint32_t *token_count,
++                                       uint8_t fingerprint[32]);
++/* Adopt an externally authenticated image identity as the session's vision
++ * state without touching KV or tokens.  Called when a disk checkpoint is
++ * restored, so the next sync can verify the pixels the payload was built from.
++ * Not valid while a sync is in flight. */
++void ds4_session_set_vision_identity(ds4_session *s,
++                                     const ds4_vision_span *images,
++                                     size_t image_count);
+ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
+ ds4_session_rewrite_result ds4_session_rewrite_from_common(
+         ds4_session *s, const ds4_tokens *prompt, int common,
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index 85d7097..3529223 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -935,7 +935,8 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
+             uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+             uint64_t now = (uint64_t)time(NULL);
+             ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
+-                                    (uint8_t)(hdr.ext_flags | hooks->ext_flag),
++                                    (uint8_t)(hdr.ext_flags | hooks->ext_flag |
++                                              hooks->extra_ext_flags),
+                                     hdr.tokens, hdr.hits, hdr.ctx_size,
+                                     hdr.created_at, now, hdr.payload_bytes);
+             ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+@@ -1255,6 +1256,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+     const uint64_t now = (uint64_t)time(NULL);
+     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+     uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
++    if (hooks) ext_flags |= hooks->extra_ext_flags;
+     if (text_override) ext_flags |= cache_text_ext;
+     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
+                             reason_code, ext_flags,
+@@ -1507,6 +1509,28 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
+     }
+     char err[160] = {0};
+     int loaded = 0;
++    /* The trailer authenticates a payload *before* any of it becomes live
++     * state.  A checkpoint this request cannot match is a miss and is never
++     * discarded: it stays exactly right for the request that wrote it.  The
++     * explicit seek follows, because the verification reads elsewhere in the
++     * file and the payload loader continues from the current position. */
++    if (header_ok && hooks && hooks->verify &&
++        !hooks->verify(hooks->ud, fp, &hdr, text_bytes, hooks->verify_wanted)) {
++        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                "%s: kv cache identity miss%s%s file=%s",
++                kv_log_name(kc),
++                responses_protocol ? " " : "",
++                responses_protocol ? "RESPPROTO" : "",
++                path);
++        fclose(fp);
++        free(cached_text);
++        free(path);
++        return 0;
++    }
++    if (header_ok && hooks && hooks->verify &&
++        fseeko(fp, (off_t)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_bytes),
++               SEEK_SET) != 0)
++        header_ok = false;
+     if (header_ok &&
+         ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
+     {
+diff --git a/ds4_kvstore.h b/ds4_kvstore.h
+index d2c0d85..5d9ff9c 100644
+--- a/ds4_kvstore.h
++++ b/ds4_kvstore.h
+@@ -16,6 +16,11 @@
+ #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
+ #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
+ #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
++/* The trailer carries the image identity (positions, row counts, pixel
++ * fingerprints) of the images the payload's KV rows were conditioned on.  A
++ * multimodal request may restore a checkpoint only when that identity matches
++ * its own spans, and a checkpoint without the bit covers no image at all. */
++#define DS4_KVSTORE_EXT_VISION_IDENTITY   (1u << 4)
+ 
+ typedef enum {
+     DS4_KVSTORE_REASON_UNKNOWN   = 0,
+@@ -101,6 +106,18 @@ typedef struct {
+     bool (*write)(void *ud, FILE *fp, const char *text, uint64_t *written_bytes);
+     int (*load)(void *ud, FILE *fp, const void *wanted);
+     const void *load_wanted;
++    /* Consulted after the header and the cached text verify and *before* the KV
++     * payload is read into the session, so a payload this request cannot trust
++     * becomes a miss instead of restored state.  Returning false never unlinks:
++     * the file stays valid for the request it does describe.  text_bytes locates
++     * the trailer (fixed header + 4 + text + payload). */
++    bool (*verify)(void *ud, FILE *fp, const ds4_kvstore_entry *hdr,
++                   uint32_t text_bytes, const void *wanted);
++    const void *verify_wanted;
++    /* Header bits this call's trailer additionally establishes, ORed in beside
++     * ext_flag.  A section the host locates by its own framing does not need
++     * one, but the log and the eviction probes read these bits. */
++    uint8_t extra_ext_flags;
+ } ds4_kvstore_trailer_hooks;
+ 
+ typedef struct {
+diff --git a/ds4_server.c b/ds4_server.c
+index 7b4c967..00e3656 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -11580,24 +11580,232 @@ static bool kv_cache_file_size_fits(const kv_disk_cache *kc,
+ 
+ 
+ 
++/* ------------------------------------------------------------------------
++ * Image identity in the checkpoint trailer.  A disk payload restores KV rows
++ * that were conditioned on image embeddings.  The token text names only the
++ * placeholder positions, so the same bytes can describe two different
++ * pictures: a checkpoint is reusable only by a request that can name the same
++ * pixels.  The identity therefore travels with the payload -- the ordered
++ * (token_start, row count, pixel fingerprint) of every image the session knew
++ * when the checkpoint was written, plus how many of them the stored frontier
++ * covers.
++ *
++ * The section is appended after the tool map and framed from the end of the
++ * file, so every existing checkpoint keeps its bytes and its tool map keeps
++ * its position.  No footer means no identity, which means "covers no image"
++ * and is loadable only by a request carrying no images.  The header bit is
++ * fail-closed: set without a readable footer rejects the load for everyone,
++ * because a checkpoint that claims image state it cannot name is exactly the
++ * wrong-attention case the gate exists for.
++ *
++ * A frontier that lands inside an image span is never stored: the payload
++ * would hold rows of an image the identity cannot describe as covered.
++ */
++#define KV_VISION_SECTION_MAGIC0 'K'
++#define KV_VISION_SECTION_MAGIC1 'V'
++#define KV_VISION_SECTION_MAGIC2 'I'
++#define KV_VISION_SECTION_MAGIC3 'S'
++#define KV_VISION_FOOTER_MAGIC0 'K'
++#define KV_VISION_FOOTER_MAGIC1 'V'
++#define KV_VISION_FOOTER_MAGIC2 'V'
++#define KV_VISION_FOOTER_MAGIC3 'S'
++#define KV_VISION_VERSION 1u
++#define KV_VISION_SECTION_HEADER 16u
++#define KV_VISION_RECORD 40u
++#define KV_VISION_FOOTER 16u
++/* Bound on a trailer a hostile or truncated file could ask us to walk.  A
++ * real request cannot exceed SERVER_MAX_IMAGES, which is far smaller. */
++#define KV_VISION_MAX_RECORDS 4096u
++
++typedef struct {
++    server *s;
++    const ds4_session *session;
++    /* Non-zero when this store describes image-conditioned KV rows and the
++     * identity below names them. */
++    bool vision;
++    int store_len;
++    size_t image_count;
++    size_t covered;
++} kv_store_ctx;
++
++typedef struct {
++    const ds4_vision_span *images;
++    size_t image_count;
++    /* Out: how many of the request's images the restored payload covers. */
++    size_t *covered_out;
++} kv_vision_verify;
++
++/* Decide whether this session's frontier can be described.  False means the
++ * caller must not write the checkpoint at all, which is today's behaviour. */
++static bool kv_vision_identity_prepare(const ds4_session *session, int store_len,
++                                       size_t *count_out, size_t *covered_out) {
++    if (count_out) *count_out = 0;
++    if (covered_out) *covered_out = 0;
++    if (!session || store_len <= 0) return false;
++    const size_t n = ds4_session_active_image_count(session);
++    uint64_t previous_end = 0;
++    size_t covered = 0;
++    for (size_t i = 0; i < n; i++) {
++        uint32_t start = 0, rows = 0;
++        uint8_t fp[32] = {0};
++        if (!ds4_session_active_image_identity(session, i, &start, &rows, fp))
++            return false;
++        const uint64_t end = (uint64_t)start + rows;
++        if (end > (uint64_t)store_len) {
++            /* Straddles the frontier: rows of this image are in the payload
++             * but the identity cannot call it covered, and a later render may
++             * place the frontier elsewhere.  Refuse the store. */
++            if (start < (uint64_t)store_len) return false;
++            break;
++        }
++        if (end < previous_end) return false;
++        previous_end = end;
++        covered++;
++    }
++    if (count_out) *count_out = n;
++    if (covered_out) *covered_out = covered;
++    return true;
++}
++
++static uint64_t kv_vision_section_bytes(const kv_store_ctx *ctx) {
++    if (!ctx || !ctx->vision || ctx->image_count == 0) return 0;
++    return KV_VISION_SECTION_HEADER +
++           (uint64_t)ctx->image_count * KV_VISION_RECORD + KV_VISION_FOOTER;
++}
++
++/* Written after the tool map, so the tool map keeps the position its loader
++ * reads from.  Streams the identity straight from the session; the caller
++ * holds inference_mu, so the spans cannot move underneath it. */
++static bool kv_vision_section_write(const kv_store_ctx *ctx, FILE *fp,
++                                    uint64_t *written) {
++    const uint64_t total = kv_vision_section_bytes(ctx);
++    if (written) *written = 0;
++    if (total == 0) return true;
++    uint8_t h[KV_VISION_SECTION_HEADER];
++    h[0] = KV_VISION_SECTION_MAGIC0;
++    h[1] = KV_VISION_SECTION_MAGIC1;
++    h[2] = KV_VISION_SECTION_MAGIC2;
++    h[3] = KV_VISION_SECTION_MAGIC3;
++    le_put32(h + 4, KV_VISION_VERSION);
++    le_put32(h + 8, (uint32_t)ctx->image_count);
++    le_put32(h + 12, (uint32_t)ctx->covered);
++    if (fwrite(h, 1, sizeof(h), fp) != sizeof(h)) return false;
++    for (size_t i = 0; i < ctx->image_count; i++) {
++        uint32_t start = 0, rows = 0;
++        uint8_t fp32[32] = {0};
++        uint8_t rec[KV_VISION_RECORD];
++        if (!ds4_session_active_image_identity(ctx->session, i, &start, &rows, fp32))
++            return false;
++        le_put32(rec, start);
++        le_put32(rec + 4, rows);
++        memcpy(rec + 8, fp32, sizeof(fp32));
++        if (fwrite(rec, 1, sizeof(rec), fp) != sizeof(rec)) return false;
++    }
++    uint8_t f[KV_VISION_FOOTER];
++    f[0] = KV_VISION_FOOTER_MAGIC0;
++    f[1] = KV_VISION_FOOTER_MAGIC1;
++    f[2] = KV_VISION_FOOTER_MAGIC2;
++    f[3] = KV_VISION_FOOTER_MAGIC3;
++    le_put32(f + 4, KV_VISION_VERSION);
++    le_put32(f + 8, (uint32_t)total);
++    f[12] = KV_VISION_SECTION_MAGIC0;
++    f[13] = KV_VISION_SECTION_MAGIC1;
++    f[14] = KV_VISION_SECTION_MAGIC2;
++    f[15] = KV_VISION_SECTION_MAGIC3;
++    if (fwrite(f, 1, sizeof(f), fp) != sizeof(f)) return false;
++    if (written) *written = total;
++    return true;
++}
++
++/* Read the identity back and check it against the request that wants the
++ * payload.  Streams, so a truncated file stops the walk.  Every field must
++ * match, positions included: the disk tier does not rebase, and a payload
++ * whose rows sit at different positions than the request's spans is a miss. */
++static bool kv_vision_section_verify(FILE *fp, uint64_t trailer_start,
++                                     uint64_t file_size,
++                                     const kv_vision_verify *want) {
++    if (!want) return false;
++    /* No room for a footer is no identity.  That is only loadable by a request
++     * with no images, and the caller decides that from the header bit; this
++     * function only ever answers "does the named identity match?". */
++    if (file_size < trailer_start + KV_VISION_FOOTER) return false;
++    uint8_t f[KV_VISION_FOOTER];
++    if (fseeko(fp, (off_t)(file_size - KV_VISION_FOOTER), SEEK_SET) != 0 ||
++        fread(f, 1, sizeof(f), fp) != sizeof(f)) return false;
++    const bool framed = f[0] == KV_VISION_FOOTER_MAGIC0 &&
++                        f[1] == KV_VISION_FOOTER_MAGIC1 &&
++                        f[2] == KV_VISION_FOOTER_MAGIC2 &&
++                        f[3] == KV_VISION_FOOTER_MAGIC3 &&
++                        le_get32(f + 4) == KV_VISION_VERSION &&
++                        f[12] == KV_VISION_SECTION_MAGIC0 &&
++                        f[13] == KV_VISION_SECTION_MAGIC1 &&
++                        f[14] == KV_VISION_SECTION_MAGIC2 &&
++                        f[15] == KV_VISION_SECTION_MAGIC3;
++    if (!framed) return false;
++    const uint32_t total = le_get32(f + 8);
++    if (total < KV_VISION_SECTION_HEADER + KV_VISION_FOOTER ||
++        total > (uint32_t)(file_size - trailer_start)) return false;
++    const uint64_t section_start = file_size - total;
++    uint8_t h[KV_VISION_SECTION_HEADER];
++    if (fseeko(fp, (off_t)section_start, SEEK_SET) != 0 ||
++        fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
++    if (h[0] != KV_VISION_SECTION_MAGIC0 || h[1] != KV_VISION_SECTION_MAGIC1 ||
++        h[2] != KV_VISION_SECTION_MAGIC2 || h[3] != KV_VISION_SECTION_MAGIC3 ||
++        le_get32(h + 4) != KV_VISION_VERSION) return false;
++    const uint32_t count = le_get32(h + 8);
++    const uint32_t covered = le_get32(h + 12);
++    if (count > KV_VISION_MAX_RECORDS ||
++        (uint64_t)KV_VISION_SECTION_HEADER + (uint64_t)count * KV_VISION_RECORD +
++            KV_VISION_FOOTER != (uint64_t)total)
++        return false;
++    if (count != want->image_count || covered > count) return false;
++    for (uint32_t i = 0; i < count; i++) {
++        uint8_t rec[KV_VISION_RECORD];
++        if (fread(rec, 1, sizeof(rec), fp) != sizeof(rec)) return false;
++        const ds4_vision_span *sp = &want->images[i];
++        if (le_get32(rec) != sp->token_start ||
++            le_get32(rec + 4) != sp->embedding.token_count ||
++            memcmp(rec + 8, sp->embedding.fingerprint, 32) != 0)
++            return false;
++    }
++    if (want->covered_out) *want->covered_out = covered;
++    return true;
++}
++
+ static bool kv_cache_tool_map_size_cb(void *ud, const char *text,
+                                       uint64_t *bytes_out) {
+-    return kv_tool_map_serialized_size((server *)ud, text, bytes_out);
++    const kv_store_ctx *ctx = (const kv_store_ctx *)ud;
++    if (bytes_out) *bytes_out = kv_vision_section_bytes(ctx);
++    if (!ctx || !ctx->s) return true;
++    uint64_t extra = 0;
++    if (!kv_tool_map_serialized_size(ctx->s, text, &extra)) return false;
++    if (bytes_out) *bytes_out += extra;
++    return true;
+ }
+ 
+ static bool kv_cache_tool_map_write_cb(void *ud, FILE *fp, const char *text,
+                                        uint64_t *written_bytes) {
+-    return kv_tool_map_write((server *)ud, fp, text, written_bytes);
++    const kv_store_ctx *ctx = (const kv_store_ctx *)ud;
++    uint64_t map_bytes = 0;
++    if (written_bytes) *written_bytes = 0;
++    if (!ctx || !ctx->s) return true;
++    if (!kv_tool_map_write(ctx->s, fp, text, &map_bytes)) return false;
++    uint64_t vis_bytes = 0;
++    if (!kv_vision_section_write(ctx, fp, &vis_bytes)) return false;
++    if (written_bytes) *written_bytes = map_bytes + vis_bytes;
++    return true;
+ }
+ 
+ static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
+-    return kv_tool_map_load_from_pos((server *)ud, fp, (const stop_list *)wanted);
++    const kv_store_ctx *ctx = (const kv_store_ctx *)ud;
++    if (!ctx || !ctx->s) return 0;
++    return kv_tool_map_load_from_pos(ctx->s, fp, (const stop_list *)wanted);
+ }
+ 
+-static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
++static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(const kv_store_ctx *ctx,
+                                                          const stop_list *wanted) {
+     return (ds4_kvstore_trailer_hooks){
+-        .ud = s,
++        .ud = (void *)ctx,
+         .ext_flag = KV_EXT_TOOL_MAP,
+         .serialized_size = kv_cache_tool_map_size_cb,
+         .write = kv_cache_tool_map_write_cb,
+@@ -11606,25 +11814,76 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
+     };
+ }
+ 
++/* Runs before the payload is read into the session, so a mismatch never
++ * becomes restored state, and never unlinks: the file is still exactly right
++ * for the request that wrote it. */
++static bool kv_cache_vision_verify_cb(void *ud, FILE *fp,
++                                      const ds4_kvstore_entry *hdr,
++                                      uint32_t text_bytes, const void *wanted) {
++    (void)ud;
++    const kv_vision_verify *want = (const kv_vision_verify *)wanted;
++    if (!hdr) return false;
++    const long now = ftell(fp);
++    if (fseeko(fp, 0, SEEK_END) != 0) return false;
++    const long size = ftell(fp);
++    if (size < 0) return false;
++    const uint64_t file_size = (uint64_t)size;
++    const uint64_t trailer_start = KV_CACHE_FIXED_HEADER + 4ull +
++                                   (uint64_t)text_bytes + hdr->payload_bytes;
++    bool ok;
++    if (hdr->ext_flags & DS4_KVSTORE_EXT_VISION_IDENTITY) {
++        /* Fail closed: the bit promises an identity, so an unreadable one is a
++         * reject even for a request with no images. */
++        ok = kv_vision_section_verify(fp, trailer_start, file_size, want);
++    } else {
++        ok = want && want->image_count == 0;
++    }
++    if (fseeko(fp, now < 0 ? 0 : (off_t)now, SEEK_SET) != 0) return false;
++    return ok;
++}
++
++/* Per-call trailer context.  Lives on the caller's stack for the duration of
++ * the store or load, which is all the hooks outlive. */
++static ds4_kvstore_trailer_hooks kv_cache_store_hooks(const kv_store_ctx *ctx,
++                                                     const stop_list *wanted,
++                                                     const kv_vision_verify *want) {
++    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(ctx, wanted);
++    if (want) {
++        hooks.verify = kv_cache_vision_verify_cb;
++        hooks.verify_wanted = want;
++    }
++    if (ctx->vision && ctx->image_count > 0)
++        hooks.extra_ext_flags = DS4_KVSTORE_EXT_VISION_IDENTITY;
++    return hooks;
++}
++
+ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
+                                             const ds4_tokens *tokens,
+                                             int store_len, const char *reason,
+                                             const char *cache_text_override,
+                                             uint8_t cache_text_ext,
+-                                            const char *cache_text_key) {
++                                            const char *cache_text_key,
++                                            bool allow_vision) {
+     if (!s || !slot) return false;
+     char err[160] = {0};
+-    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+     pthread_mutex_lock(&s->inference_mu);
+-    /* The payload contains image-conditioned KV rows, but the disk key and
+-     * trailer do not contain image fingerprints. Never let generic image
+-     * placeholder tokens become a cache hit for a different image.
+-     * sync_image_count covers progress-callback writes during prefill;
+-     * checkpoint_image_count covers completed sessions. */
++    /* The payload contains image-conditioned KV rows.  Generic image
++     * placeholder tokens must never become a cache hit for a different image,
++     * so a vision payload is written only when its identity can name every
++     * image those rows came from: sync_image_count covers progress-callback
++     * writes during prefill, checkpoint_image_count covers completed sessions.
++     * A caller that has not been opened to vision keeps the old bail. */
++    kv_store_ctx ctx = { .s = s, .session = slot->session };
+     if (ds4_session_has_vision_state(slot->session)) {
+-        pthread_mutex_unlock(&s->inference_mu);
+-        return false;
++        if (!allow_vision ||
++            !kv_vision_identity_prepare(slot->session, store_len,
++                                        &ctx.image_count, &ctx.covered)) {
++            pthread_mutex_unlock(&s->inference_mu);
++            return false;
++        }
++        ctx.vision = ctx.image_count != 0;
+     }
++    ds4_kvstore_trailer_hooks hooks = kv_cache_store_hooks(&ctx, NULL, NULL);
+     pthread_mutex_lock(&s->kv_mu);
+     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
+                                                   slot->session,
+@@ -11640,9 +11899,10 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
+ 
+ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
+                                        const ds4_tokens *tokens,
+-                                       int store_len, const char *reason) {
++                                       int store_len, const char *reason,
++                                       bool allow_vision) {
+     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
+-                                           NULL, 0, NULL);
++                                           NULL, 0, NULL, allow_vision);
+ }
+ 
+ /* Persist an already reached prompt frontier before the new
+@@ -11666,7 +11926,8 @@ static void kv_cache_maybe_store_prompt_tail(server *s, server_slot *slot,
+         (uint32_t)(prompt->len - covered) < chunk) return;
+     (void)kv_cache_store_live_prefix_text(s, slot, prompt, prompt->len,
+                                          "near-tail", req->prompt_text,
+-                                         KV_EXT_RESPONSES_VISIBLE, "responses-prompt");
++                                         KV_EXT_RESPONSES_VISIBLE,
++                                         "responses-prompt", false);
+ }
+ 
+ /* Select the disk key for the slot's current live checkpoint.  Returns the
+@@ -11726,7 +11987,7 @@ static bool kv_current_checkpoint_is_visible_keyed(server *s,
+ }
+ 
+ static void kv_cache_store_current(server *s, server_slot *slot,
+-                                   const char *reason) {
++                                   const char *reason, bool allow_vision) {
+     if (!s || !slot) return;
+     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+     if (!tokens) return;
+@@ -11742,11 +12003,15 @@ static void kv_cache_store_current(server *s, server_slot *slot,
+      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
+      * tokenizes only the visible suffix that follows this key. */
+     if (visible_text) {
++        /* A visible-transcript key is the fork-guarded kind; stage 1 keeps
++         * vision out of it and keeps the bail inside the store. */
+         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+-                                        visible_text, visible_ext, visible_key);
++                                        visible_text, visible_ext, visible_key,
++                                        false);
+         free(visible_text);
+     } else {
+-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
++        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason,
++                                   allow_vision);
+     }
+ }
+ 
+@@ -11853,7 +12118,8 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+     if (!tokens) return;
+     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
+     if (target == 0) return;
+-    if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
++    if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued",
++                                   true)) {
+         (void)kc;
+         kv_cache_slot_note_store(slot, target);
+     }
+@@ -11868,6 +12134,8 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
+ 
+ static int kv_cache_try_load_text(server *s, server_slot *slot,
+                                   const char *prompt_text,
++                                  const ds4_vision_span *images,
++                                  size_t image_count,
+                                   ds4_tokens *effective_prompt,
+                                   char **loaded_path_out,
+                                   uint8_t *loaded_ext_flags_out,
+@@ -11876,11 +12144,18 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
+     if (loaded_path_out) *loaded_path_out = NULL;
+     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+     ds4_kvstore_load_result lr = {0};
+-    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
++    kv_store_ctx ctx = { .s = s, .session = slot->session };
++    size_t covered = 0;
++    const kv_vision_verify want = {
++        .images = images, .image_count = image_count, .covered_out = &covered,
++    };
++    ds4_kvstore_trailer_hooks hooks = kv_cache_store_hooks(&ctx, NULL, &want);
+     pthread_mutex_lock(&s->inference_mu);
+-    /* Disk payloads intentionally carry no image identity. If this slot held
+-     * vision state, discard it before restoring a text-only checkpoint so the
+-     * next sync does not reject the fresh payload as a stale image match. */
++    /* Discard any vision state this slot held before the loader replaces it:
++     * the next sync must not read the old spans as a match for the fresh
++     * payload.  A checkpoint that names images is verified against the request
++     * before its payload is read at all, and the identity it names is adopted
++     * below only once the payload is live. */
+     if (ds4_session_has_vision_state(slot->session)) {
+         ds4_session_invalidate(slot->session);
+     }
+@@ -11888,6 +12163,12 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
+     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
+                                            prompt_text, effective_prompt, &lr,
+                                            &hooks, responses_protocol);
++    if (loaded > 0 && image_count > 0) {
++        /* The payload covers the first `covered` images of this request and
++         * nothing after them, so that is the whole of the session's image
++         * state until the suffix sync re-records it. */
++        ds4_session_set_vision_identity(slot->session, images, covered);
++    }
+     pthread_mutex_unlock(&s->kv_mu);
+     pthread_mutex_unlock(&s->inference_mu);
+     if (loaded > 0) {
+@@ -11903,6 +12184,8 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
+                              char **loaded_path_out,
+                              uint8_t *loaded_ext_flags_out) {
+     return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
++                                  req ? req->images : NULL,
++                                  req ? req->image_count : 0,
+                                   effective_prompt,
+                                   loaded_path_out,
+                                   loaded_ext_flags_out,
+@@ -13733,6 +14016,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
+         ds4_tokens effective = {0};
+         int loaded = kv_cache_try_load_text(s, slot,
+                                             rendered.ptr ? rendered.ptr : "",
++                                            NULL, 0,
+                                             &effective, &path, NULL, false);
+         if (loaded == 0) {
+             pthread_mutex_lock(&s->inference_mu);
+@@ -14358,7 +14642,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+                    heal_persists_live ? "token-text key: persist live prefix, accept byte-verified disk payload"
+                                       : "visible key: skip forked evict-store, reject forked disk load");
+     }
+-    if (!multimodal && s->kv.enabled && cached == 0 &&
++    if (s->kv.enabled && cached == 0 &&
+         old_pos >= s->kv.opt.min_tokens &&
+         (!responses_fork_heal || heal_persists_live)) {
+         /* Loading a disk snapshot replaces the live Metal session.  Persist the
+@@ -14370,9 +14654,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+          * describes its own bytes, so the next owner of this conversation
+          * matches it honestly and the departing client keeps a frontier
+          * instead of rebuilding from zero. */
+-        kv_cache_store_current(s, slot, "evict");
++        kv_cache_store_current(s, slot, "evict", true);
+     }
+-    if (!multimodal && cached == 0) {
++    /* Stage 1 of multimodal disk reuse: the load is open to vision, and the
++     * payload is accepted only when the trailer names the request's images
++     * exactly (kv_cache_vision_verify_cb).  Fork healing stays text-only, so a
++     * vision request never re-seeds a visible-keyed fork. */
++    if (cached == 0) {
+         /* A forked visible-keyed payload no longer ends the disk tier.
+          * Discarding it stays (0007's protection: the forked text is a byte
+          * prefix of every later render of this conversation, so keeping it
+@@ -14588,7 +14876,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+             return;
+         }
+         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+-                                       cold_store_len, "cold")) {
++                                       cold_store_len, "cold", false)) {
+             cold_saved = true;
+             kv_cache_slot_note_store(slot, cold_store_len);
+             suppressed_continued_last = -1;
+@@ -14642,7 +14930,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+     if (!thinking_live_continuation) thinking_live_clear(s, slot);
+     ds4_session_set_progress(slot->session, NULL, NULL);
+     ds4_session_set_display_progress(slot->session, NULL, NULL);
+-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
++    kv_cache_maybe_store_continued(s, slot);
+     server_log(DS4_LOG_PREFILL,
+                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
+                j->req.kind == REQ_CHAT ? "chat" : "completion",
+@@ -14652,7 +14940,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+                now_sec() - t0);
+     if (cold_store_len == prompt_for_sync->len) {
+         if (!multimodal && kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+-                                       cold_store_len, "cold")) {
++                                       cold_store_len, "cold", false)) {
+             cold_saved = true;
+             kv_cache_slot_note_store(slot, cold_store_len);
+             suppressed_continued_last = -1;
+@@ -14783,7 +15071,7 @@ decode_again:
+             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
+         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
+         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
+-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
++            kv_cache_maybe_store_continued(s, slot);
+         }
+         float temperature = j->req.temperature;
+         int top_k = j->req.top_k;
+@@ -17033,7 +17321,7 @@ int main(int argc, char **argv) {
+         server_log(DS4_LOG_KVCACHE,
+                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
+                    i, tokens->len);
+-        kv_cache_store_current(&s, slot, "shutdown");
++        kv_cache_store_current(&s, slot, "shutdown", true);
+     }
+     server_close_resources(&s);
+     return 0;
+@@ -25467,6 +25755,185 @@ static void test_deepseek41_live_result_order(void) {
+     pthread_mutex_destroy(&s.tool_mu);
+ }
+ 
++/* The checkpoint trailer is the only place a vision payload can name the
++ * pixels its KV rows came from, so every rule that keeps a wrong-attention
++ * load from happening lives in this section's framing.  These cases are the
++ * gate: a match, four ways a mismatch must refuse, the fail-closed bit, and
++ * the two shapes an old checkpoint has no way to produce. */
++static void test_vision_identity_trailer(void) {
++    const int ids[4] = { 1, 2, 3, 4 };
++    ds4_vision_span spans[2];
++    memset(spans, 0, sizeof(spans));
++    spans[0].token_start = 1000;
++    spans[0].embedding.token_count = 64;
++    spans[0].embedding.fingerprint[0] = 7;
++    spans[1].token_start = 2000;
++    spans[1].embedding.token_count = 96;
++    spans[1].embedding.fingerprint[0] = 8;
++    ds4_session *sess = ds4_session_new_test_checkpoint(ids, 4);
++    TEST_ASSERT(sess != NULL);
++    ds4_session_set_test_images(sess, spans, 2);
++
++    size_t count = 0, covered = 0;
++    /* A frontier inside an image names rows the identity cannot call covered,
++     * so the store must not happen at all. */
++    TEST_ASSERT(!kv_vision_identity_prepare(sess, 2032, &count, &covered));
++    TEST_ASSERT(!kv_vision_identity_prepare(sess, 1024, &count, &covered));
++    TEST_ASSERT(kv_vision_identity_prepare(sess, 2096, &count, &covered));
++    TEST_ASSERT(count == 2 && covered == 2);
++    /* A frontier before every image stores cleanly and covers nothing. */
++    TEST_ASSERT(kv_vision_identity_prepare(sess, 500, &count, &covered));
++    TEST_ASSERT(count == 2 && covered == 0);
++
++    FILE *fp = tmpfile();
++    TEST_ASSERT(fp != NULL);
++    kv_store_ctx ctx = { .session = sess, .vision = true,
++                         .store_len = 2096, .image_count = 2, .covered = 2 };
++    uint64_t written = 0;
++    TEST_ASSERT(kv_vision_section_write(&ctx, fp, &written));
++    TEST_ASSERT(written == KV_VISION_SECTION_HEADER + 2u * KV_VISION_RECORD +
++                           KV_VISION_FOOTER);
++    /* The tool map keeps the first position, so the section cannot start
++     * before the caller's own bytes. */
++    const uint64_t trailer_start = 0;
++    long size = 0;
++    TEST_ASSERT(fseeko(fp, 0, SEEK_END) == 0);
++    size = ftell(fp);
++    TEST_ASSERT((uint64_t)size == trailer_start + written);
++    /* The footer is the last thing in the file, and it is what a reader finds
++     * without knowing the tool map's length. */
++    uint8_t foot[KV_VISION_FOOTER];
++    TEST_ASSERT(fseeko(fp, (off_t)(size - (long)KV_VISION_FOOTER), SEEK_SET) == 0);
++    TEST_ASSERT(fread(foot, 1, sizeof(foot), fp) == sizeof(foot));
++    TEST_ASSERT(foot[0] == KV_VISION_FOOTER_MAGIC0 &&
++                foot[12] == KV_VISION_SECTION_MAGIC0);
++
++    size_t got = 99;
++    kv_vision_verify want = { .images = spans, .image_count = 2,
++                              .covered_out = &got };
++    TEST_ASSERT(kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
++                                        &want));
++    TEST_ASSERT(got == 2);
++
++    /* One changed pixel: same text, same positions, different picture. */
++    ds4_vision_span other[2];
++    memcpy(other, spans, sizeof(other));
++    other[1].embedding.fingerprint[0] = 9;
++    got = 99;
++    want.images = other;
++    TEST_ASSERT(!kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
++                                         &want));
++    /* Same pixels, different row count: the spans no longer describe the KV. */
++    memcpy(other, spans, sizeof(other));
++    other[0].embedding.token_count = 65;
++    TEST_ASSERT(!kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
++                                         &want));
++    /* Same pixels, shifted position: the disk tier does not rebase. */
++    memcpy(other, spans, sizeof(other));
++    other[1].token_start = 2001;
++    TEST_ASSERT(!kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
++                                         &want));
++    /* One image appended: the frontier's coverage is not what was stored. */
++    ds4_vision_span three[3];
++    memcpy(three, spans, sizeof(spans));
++    three[2].token_start = 3000;
++    three[2].embedding.token_count = 32;
++    three[2].embedding.fingerprint[0] = 9;
++    want.images = three;
++    want.image_count = 3;
++    TEST_ASSERT(!kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
++                                         &want));
++    want.images = spans;
++    want.image_count = 2;
++    want.covered_out = NULL;
++    TEST_ASSERT(kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
++                                        &want));
++    fclose(fp);
++
++    /* A file with no section at all: the shape every checkpoint written before
++     * this patch has, and the shape a text checkpoint keeps.  Text loads,
++     * images do not, and that is decided by the header bit alone. */
++    fp = tmpfile();
++    TEST_ASSERT(fp != NULL);
++    ctx.vision = false;
++    written = 0;
++    TEST_ASSERT(kv_vision_section_write(&ctx, fp, &written) && written == 0);
++    TEST_ASSERT(fseeko(fp, 0, SEEK_END) == 0 && ftell(fp) == 0);
++    ds4_kvstore_entry hdr;
++    memset(&hdr, 0, sizeof(hdr));
++    want.images = NULL;
++    want.image_count = 0;
++    TEST_ASSERT(kv_cache_vision_verify_cb(NULL, fp, &hdr, 0, &want));
++    want.image_count = 2;
++    want.images = spans;
++    TEST_ASSERT(!kv_cache_vision_verify_cb(NULL, fp, &hdr, 0, &want));
++    /* Truncated garbage is not a footer, and a bit that promises an identity
++     * the file cannot produce is a reject for every request, text included. */
++    uint8_t junk[64] = { 0 };
++    TEST_ASSERT(fwrite(junk, 1, sizeof(junk), fp) == sizeof(junk));
++    TEST_ASSERT(fseeko(fp, 0, SEEK_END) == 0);
++    want.image_count = 0;
++    want.images = NULL;
++    TEST_ASSERT(kv_cache_vision_verify_cb(NULL, fp, &hdr, 0, &want));
++    hdr.ext_flags = DS4_KVSTORE_EXT_VISION_IDENTITY;
++    TEST_ASSERT(!kv_cache_vision_verify_cb(NULL, fp, &hdr, 0, &want));
++    /* A real framed checkpoint: header, cached text, payload, then the
++     * section.  This is the one shape that may serve a multimodal request, and
++     * the trailer starts where the fixed header says it must. */
++    fp = tmpfile();
++    TEST_ASSERT(fp != NULL);
++    TEST_ASSERT(fwrite(junk, 1, sizeof(junk), fp) == sizeof(junk));
++    ctx.vision = true;
++    ctx.image_count = 2;
++    ctx.covered = 2;
++    TEST_ASSERT(kv_vision_section_write(&ctx, fp, &written));
++    memset(&hdr, 0, sizeof(hdr));
++    hdr.ext_flags = DS4_KVSTORE_EXT_VISION_IDENTITY;
++    hdr.payload_bytes = 0;
++    const uint64_t fake_map = (uint64_t)sizeof(junk);
++    /* The 64 bytes above stand in for a tool map whose length a reader cannot
++     * know: the footer locates the section by its own size, which is why the
++     * section is found at all without consulting the map. */
++    TEST_ASSERT((uint64_t)ftell(fp) == fake_map + written);
++    want.images = spans;
++    want.image_count = 2;
++    got = 99;
++    want.covered_out = &got;
++    TEST_ASSERT(kv_cache_vision_verify_cb(NULL, fp, &hdr, 0, &want));
++    TEST_ASSERT(got == 2);
++    /* The hook restores the position the payload loader continues from. */
++    TEST_ASSERT(ftell(fp) == (long)(fake_map + written));
++    other[0].embedding.fingerprint[0] = 42;
++    want.images = other;
++    TEST_ASSERT(!kv_cache_vision_verify_cb(NULL, fp, &hdr, 0, &want));
++    fclose(fp);
++
++    /* Fail closed on a file that cannot hold a footer at all. */
++    ds4_kvstore_entry hdr2;
++    memset(&hdr2, 0, sizeof(hdr2));
++    fp = tmpfile();
++    TEST_ASSERT(fp != NULL);
++    hdr2.ext_flags = DS4_KVSTORE_EXT_VISION_IDENTITY;
++    hdr2.payload_bytes = 0;
++    want.images = NULL;
++    want.image_count = 0;
++    want.covered_out = NULL;
++    TEST_ASSERT(!kv_cache_vision_verify_cb(NULL, fp, &hdr2, 0, &want));
++    hdr2.ext_flags = 0;
++    TEST_ASSERT(kv_cache_vision_verify_cb(NULL, fp, &hdr2, 0, &want));
++    /* The verify hook must leave the position where the payload loader finds
++     * it, because that loader continues from the current offset. */
++    uint8_t payload[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
++    TEST_ASSERT(fwrite(payload, 1, sizeof(payload), fp) == sizeof(payload));
++    TEST_ASSERT(fflush(fp) == 0);
++    TEST_ASSERT(fseeko(fp, 2, SEEK_SET) == 0);
++    hdr2.ext_flags = DS4_KVSTORE_EXT_VISION_IDENTITY;
++    TEST_ASSERT(!kv_cache_vision_verify_cb(NULL, fp, &hdr2, 0, &want));
++    TEST_ASSERT(ftell(fp) == 2);
++    fclose(fp);
++    ds4_session_free_test_checkpoint(sess);
++}
++
+ static void ds4_server_unit_tests_run(void) {
+     test_deepseek41_server_stream();
+     test_deepseek41_server_tools();
+@@ -25478,6 +25945,7 @@ static void ds4_server_unit_tests_run(void) {
+     test_server_image_embedding_cache();
+     test_server_image_embedding_cache_thrash();
+     test_vision_cache_mb_option();
++    test_vision_identity_trailer();
+     test_batched_prefill_round_robin();
+     test_mixed_prefill_quantum_option();
+     test_multimodal_prefill_resume_frontier();

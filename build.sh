@@ -224,6 +224,27 @@
 #       still invalidated), and log "kv cache entry kept reason=cancelled-*".
 #       The forked-payload discard (0007/0012) is untouched - that payload IS
 #       wrong for the prompt and must go.
+#   0016-kv-vision-identity-in-checkpoint-trailer.patch
+#       The disk KV tier was closed to multimodal by nine !multimodal guards,
+#       because a payload carries image-conditioned KV rows that the token text
+#       cannot name. Cost, measured 2026-11-14 15:06 (owner's escape in the
+#       vision profile): live=242,039, prompt=240,227, common=240,217 - 99.996 %
+#       of the prompt was already computed and the resume re-prefilled all of it
+#       (51.2 % in 92.7 s, so ~181 s) for a 10-token suffix. Now the checkpoint
+#       trailer names the images its own range covers - ordered token_start,
+#       row count and pixel fingerprint, taken from the session that produced
+#       the rows - and the loader verifies that list before the payload is read
+#       into a session. A mismatch is a miss, never an unlink. No header format
+#       bump: the section is appended after the tool map and framed from EOF, so
+#       a pre-existing checkpoint keeps its bytes, its tool map keeps its
+#       position, and "no identity" simply means "covers no image". A frontier
+#       inside an image span is not stored at all. Stage 1 opens the ladder
+#       (continued) store, the store-before-evict and the load; the near-tail,
+#       prompt-tail and cold sites stay closed. Tests:
+#       test_vision_identity_trailer (mutation-checked four ways: a verify that
+#       always passes, a prepare that accepts a straddling frontier, a verify
+#       that ignores token_start, and a promised-but-missing identity treated as
+#       a miss instead of a reject each turn the suite red).
 #
 # ARCHIVE: patches/archive/0005-…superseded-by-pr-1206.patch — our FIX-1. The
 # visible-suffix gate change is replaced by #1206's two-key design, which also
@@ -371,6 +392,7 @@ apply patches/0012-kv-fork-next-shorter-candidate.patch
 apply patches/0013-responses-cancel-remember-partial-visible.patch
 apply patches/0014-kv-keep-payload-on-cancelled-prefill.patch
 apply patches/0015-vision-embedding-cache-sized-from-flag.patch
+apply patches/0016-kv-vision-identity-in-checkpoint-trailer.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim

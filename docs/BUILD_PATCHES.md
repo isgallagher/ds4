@@ -37,6 +37,7 @@ we build on while they wait for merge; group B is our own fixes.
 | B11 | `patches/0012-kv-fork-next-shorter-candidate.patch` | a forked visible-keyed disk payload no longer ends the disk tier: the 0007 discard stays (protective), the lookup is retried (the refresh inside rescans the store directory, so the discarded file is never offered again), and the next-shorter candidate gets its own lockstep check — a pre-fork ladder checkpoint is token-exact and loads. Bounds any re-render fork at prompt−frontier (2026-10-31 shape: 229 s → ~154 s). Bounded at 4 attempts; live-smoke-verified, same verification shape as B6 | ours, no PR |
 | B12 | `patches/0013-responses-cancel-remember-partial-visible.patch` | **the branch the escape actually takes.** `generate_job_inner` has seven `request_live_state_clear()` sites under `job_cancelled`; an interrupted decode returns at the first one after the loop ("cancelled during generation after N tokens"), which B10 left as a silent clear — so B10's log line could never appear for an escape, and the 23:14 / 23:18 recoveries were the disk and memory-token tiers. That branch cannot reuse B10's helper either: the completed-turn builder closes the surface with the model's end-of-turn marker, and a cancelled turn never commits that token, so the handle would claim one token more than the live KV holds — **wrong reuse, not the safe miss**. This patch remembers a **partial** surface (prompt text + reasoning-so-far, or + content-so-far, no marker appended) so the next request re-tokenizes the boundary and end-of-turn tokens onto the live KV; single-surface partials only, everything else keeps the clear. The parser is asked with the closed-thinking requirement off, because the cancelled turn is unclosed by definition. Test: `test_responses_cancel_release_live_partial`, mutation-checked | ours, no PR |
 | B13 | `patches/0014-kv-keep-payload-on-cancelled-prefill.patch` | **a cancelled prefill deleted a good checkpoint.** The prefill failure path unlinked the disk payload it had just loaded; B8 gave the cancel its own reason label, but the unlink stayed. Measured 2026-11-01 10:16: a 65,536-token hit from `66b52486…kv`, the prefill cancelled, then the same file unlinked → the next request resumed at 30,985 and re-prefilled **112,866** tokens (~5 min). Every interrupt made the store permanently worse, which is what an owner experiences as "it got slower after I pressed escape". Now the cancel path keeps the payload and runs the same session and schedule bookkeeping (the mid-sync session is still invalidated), logging `kv cache entry kept reason=cancelled-*`. The `forked-payload` discard stays — that payload really is wrong for the prompt | ours, no PR |
+| B14 | `patches/0015-vision-embedding-cache-sized-from-flag.patch` | **the vision embedding cache could not hold the conversation, so it re-encoded every image on every turn.** B5 made the key the pixel fingerprint and dropped the client bytes from the accounting, which left `SERVER_IMAGE_CACHE_BYTES` (128 MiB, compile-time) holding **13 images of 1000 tokens** at the 2560-wide fp32 row width (10,240,000 B each). A session that reaches 15 screenshots cannot fit its own working set, and because every request replays every image in history order the LRU victim is always the next image that same request asks for, so one over-capacity step is a **permanent full-set re-encode**, not a one-image degradation. Measured 2026-11-14 (one agent session, 3 h log): 14 hits + 1 encode per turn while the cache climbed to 13,092 of the 13,107 available token-rows, then **0 hits and 15 encodes per turn** (79 s and 83 s of encoder time for requests whose model work was 1.5 s prefill + 22 s decode, with the KV hitting every time: `cached=228077 prompt=228332`). Now: entry cap `32 -> SERVER_MAX_IMAGES` (256, so the entry limit can never bind before the byte limit), and the budget is `--vision-cache-mb N` (default **1024** = ~100 images; `0` disables). Startup logs `vision embedding cache %zu MiB, %d entries`. Tests: `test_server_image_embedding_cache_thrash` (over-budget => every round re-encodes every image, forever; fits-budget => encodes stop after round 1) and `test_vision_cache_mb_option` (default parsed as the literal 1024, and the default must hold the 15x1000-token set that failed). Both mutation-checked: lowering the default to 128 fails 2 assertions; a `put` that ignores its budget fails the thrash bound. **Deviation from "local patches touch `ds4_server.c` only": one line in `ds4_help.c`, so the flag appears in `--help`** | ours, no PR |
 
 - **Tracker for group A:** upstream issue #1201. Its merge order is
   `1175 → 1169 → 1206 → 1200`, with "#1206 must merge after #1169" (it relies on
@@ -101,7 +102,7 @@ tracker order does not contain them both.
 | Build script | `~/repos/ds4/build.sh` | resolve → patch → build → install → re-sign |
 | **Contract commit** | `CONTRACT_REF` in `build.sh` (today **`b3f5018`**, moved 2026-11-10 from `c97964b` per §C: pr1175 adapted to the #1245 `SERVER_MAX_IMAGES` rename, pr1200 `.gitignore` union, pr1169/pr1212 3-way context merges; all 21 re-applied clean, §Verification 1–3 passed) | the upstream commit the whole patch set is verified on; it is the **default**, so a plain `./build.sh` never builds an unverified tree |
 | Upstream PR patches | `patches/upstream/` | stored verbatim diffs, pinned by the SHAs above |
-| Our patches | `patches/` | `0001`…`0004`, `0006`…`0014` (0005 is archived), numbered; next is `0015` |
+| Our patches | `patches/` | `0001`…`0004`, `0006`…`0015` (0005 is archived), numbered; next is `0016` |
 | Archived patch | `patches/archive/` | kept for the record, never applied |
 | Upstream repo | `origin` = `git@github.com:antirez/ds4` (SSH — unusable on this box, see §Fetch) | upstream branch is **`main`**, not `master` |
 | Fix branch | `fix/responses-replay-status-tolerance` (**local only** — removed from the fork 2026-11-11: its commit metadata carried machine-default emails and the fork is public) | carries `build.sh` + `patches/` + docs; the local branch is the record/fallback; never push it again |
@@ -347,6 +348,26 @@ change is a branch on an existing predicate, and the observable is the log line
 `kv cache entry kept reason=cancelled-*` in place of `kv cache discarded`. **Step 4 owed for
 B13:** interrupt a turn while a long prefill runs, and confirm the payload survives
 (`entry kept`, not `discarded`) and the following request still hits that token count.
+
+**B14 added 2026-11-14** (owner's "the images keep being reprocessed every time"; evidence
+in the 3 h log of the `start-qwen38-longctx-vision.sh` session, 06:15-09:04). Applies
+**clean** after the 21-patch sequence on `b3f5018`. §Verification 1-3: `./build.sh` exit 0,
+**22 of 22 `applied (clean)`** (this run needed no `-3`), last line
+`b3f5018 + 8 upstream PR patches + 14 local patches`, `codesign -v` clean; fresh-tree
+byte-identity holds for `ds4_server.c` **and** `ds4_help.c` vs the tested tree;
+`ds4_test --server` → `server: OK`, `ds4 tests: ok` (only the documented
+`thinking not closed` line); `test-kvstore-near-tail` → `PASS`;
+`test-qwen-tool-disk-key` → the documented `FAIL (8 failures)`.
+**Two new tests, both mutation-checked:** lowering `SERVER_IMAGE_CACHE_DEFAULT_MB` back to
+128 fails 2 assertions in `test_vision_cache_mb_option`; a `put` that ignores its budget
+fails `cache.bytes <= tight` in `test_server_image_embedding_cache_thrash`.
+**Test defect found and fixed while adding B14:** `test_server_image_embedding_cache`
+built its keys in one byte, so with the cap raised to `SERVER_MAX_IMAGES` (256) key 257
+aliased onto key 1 and the eviction assertion would have passed for the wrong reason — the
+loop and the lookup now use two key bytes. **Step 4 owed for B14:** start the vision
+profile, confirm `vision embedding cache 1024 MiB, 256 entries` at startup, then run the
+15-image agent session and confirm the per-turn pattern returns to
+`hits = images-1, encodes = 1` instead of `hits = 0, encodes = 15`.
 
 ## Swapping the live server onto a fresh build
 

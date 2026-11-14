@@ -1,0 +1,247 @@
+diff --git a/ds4_help.c b/ds4_help.c
+index a29c1f6..4d9d04d 100644
+--- a/ds4_help.c
++++ b/ds4_help.c
+@@ -150,6 +150,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
+     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+         opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
+     }
++    if (tool == DS4_HELP_SERVER) {
++        opt(fp, c, "--vision-cache-mb N", "Embedding cache budget per image fingerprint, in MiB. Default: 1024 (0 disables)");
++    }
+ #ifdef DS4_ROCM_BUILD
+     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
+     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
+diff --git a/ds4_server.c b/ds4_server.c
+index 478e990..7b4c967 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -10317,8 +10317,20 @@ struct server_slot {
+     char decode_err[160];
+ };
+ 
+-#define SERVER_IMAGE_CACHE_ENTRIES 32
+-#define SERVER_IMAGE_CACHE_BYTES (128u * 1024u * 1024u)
++/* Sized for the conversation, not for one image.  A 1000-token image at the
++ * 2560-wide fp32 row width costs 10,240,000 bytes, so the old compile-time
++ * 128 MiB budget held 13 images.  An agent conversation that carries 15
++ * screenshots therefore could not fit its own working set, and because every
++ * request replays every image in history order, the LRU victim was always the
++ * next image that same request asks for: one over-capacity step turned into a
++ * full-set re-encode on every later turn (measured 2026-11-14, one session:
++ * 14 hits + 1 encode per turn up to 13,092 cached rows, then 0 hits and 15
++ * encodes per turn -- 79 s and 83 s of encoder time for a request whose model
++ * work was 1.5 s of prefill plus 22 s of decode).  The entry cap now matches
++ * the per-request image limit, and the byte budget is a runtime setting. */
++#define SERVER_IMAGE_CACHE_ENTRIES SERVER_MAX_IMAGES
++#define SERVER_IMAGE_CACHE_DEFAULT_MB 1024u
++#define SERVER_IMAGE_CACHE_BYTES (SERVER_IMAGE_CACHE_DEFAULT_MB * 1024u * 1024u)
+ 
+ typedef struct {
+     uint8_t fingerprint[32];
+@@ -10421,6 +10433,7 @@ struct server {
+     kv_disk_cache kv;
+     tool_memory tool_mem;
+     server_image_cache image_cache; /* Protected by inference_mu. */
++    size_t image_cache_bytes;       /* Budget from --vision-cache-mb; 0 disables the cache. */
+     bool disable_exact_dsml_tool_replay;
+     bool enable_cors;
+     pthread_mutex_t tool_mu;
+@@ -10485,7 +10498,7 @@ static bool server_encode_image(server *s, const server_image_input *input,
+      * above, so future lookups hash to this entry. */
+     server_image_cache_put(&s->image_cache, out->fingerprint, out,
+                             (uint32_t)ds4_engine_embd_dim(s->engine),
+-                            SERVER_IMAGE_CACHE_BYTES);
++                            s->image_cache_bytes);
+     server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
+                s->image_cache.bytes);
+     return true;
+@@ -16308,6 +16321,7 @@ typedef struct {
+     bool enable_cors;
+     int batched_sessions;
+     int mixed_prefill_quantum;
++    int vision_cache_mb;
+ } server_config;
+ 
+ static int parse_int_arg(const char *s, const char *opt) {
+@@ -16457,6 +16471,7 @@ static server_config parse_options(int argc, char **argv) {
+         .default_tokens = 393216,
+         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+         .mixed_prefill_quantum = 128,
++        .vision_cache_mb = (int)SERVER_IMAGE_CACHE_DEFAULT_MB,
+     };
+     c.kv_cache = kv_cache_default_options();
+ 
+@@ -16508,6 +16523,8 @@ static server_config parse_options(int argc, char **argv) {
+             c.engine.model_path = need_arg(&i, argc, argv, arg);
+         } else if (!strcmp(arg, "--vision")) {
+             c.engine.vision_path = need_arg(&i, argc, argv, arg);
++        } else if (!strcmp(arg, "--vision-cache-mb")) {
++            c.vision_cache_mb = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+         } else if (!strcmp(arg, "--mtp")) {
+             c.engine.glm_mtp = true;
+         } else if (!strcmp(arg, "--mtp-model")) {
+@@ -16824,6 +16841,7 @@ int main(int argc, char **argv) {
+     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
+                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
+     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
++    s.image_cache_bytes = (size_t)cfg.vision_cache_mb * 1024u * 1024u;
+     s.last_prefill_slot = slot_count - 1;
+     s.default_tokens = cfg.default_tokens;
+     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+@@ -16875,6 +16893,11 @@ int main(int argc, char **argv) {
+         server_log(DS4_LOG_DEFAULT,
+                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
+     }
++    if (ds4_engine_has_vision(engine)) {
++        server_log(DS4_LOG_DEFAULT,
++                   "ds4-server: vision embedding cache %zu MiB, %d entries",
++                   s.image_cache_bytes >> 20, SERVER_IMAGE_CACHE_ENTRIES);
++    }
+     if (s.batched_mode) {
+         server_log(DS4_LOG_DEFAULT,
+                    "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
+@@ -25117,10 +25140,18 @@ static void test_server_image_embedding_cache(void) {
+     TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
+     for (size_t key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++) {
+         memset(fingerprint, 0, sizeof(fingerprint));
++        /* Two bytes of key: the entry cap is SERVER_MAX_IMAGES (256), so a
++         * single byte would alias key 257 back onto key 1 and the miss
++         * assertion below would pass for the wrong reason. */
+         fingerprint[0] = (uint8_t)key;
++        fingerprint[1] = (uint8_t)(key >> 8);
+         server_image_cache_put(&cache, fingerprint, &src, 2, 4096);
+     }
+     TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * sizeof(data));
++    /* Reset the whole key: the loop left it holding key ENTRIES+1, whose low
++     * byte is also 1, and a stale high byte would look up the entry the loop
++     * just inserted instead of the one it evicted. */
++    memset(fingerprint, 0, sizeof(fingerprint));
+     fingerprint[0] = 1;
+     TEST_ASSERT(!server_image_cache_get(&cache, fingerprint, &out));
+     server_image_cache_clear(&cache);
+@@ -25150,6 +25181,115 @@ static void test_server_image_embedding_cache(void) {
+     server_image_cache_clear(&cache);
+ }
+ 
++/* The 2026-11-14 failure shape, as a regression:
++ *   - every request replays every image in history order (that is what
++ *     request_tokenize_multimodal_prompt does), so a hit refreshes recency in
++ *     that same order;
++ *   - the put loop evicts the least-recently-used entry to make room, which is
++ *     the next entry this same request is about to ask for;
++ *   - so a working set that does not fit the budget does not degrade by one
++ *     image per turn -- it loses every image on every turn.
++ * The old 128 MiB budget held 13 images of 1000 tokens, and the session that
++ * reported this had 15. Assert both halves: over-budget thrashes forever, a
++ * budget that fits the set stops encoding after round 1. */
++static void test_server_image_embedding_cache_thrash(void) {
++    const uint32_t dim = 2560;
++    const uint32_t tokens = 1000;               /* 10,240,000 bytes each */
++    const size_t images = 15;
++    const size_t entry_bytes = (size_t)tokens * dim * sizeof(float);
++    server_image_cache cache = {0};
++
++    /* Over budget: 14 images fit, 15 do not. */
++    const size_t tight = entry_bytes * 14;
++    size_t first_round_encodes = 0, steady_encodes = 0;
++    for (size_t round = 0; round < 3; round++) {
++        size_t encodes = 0;
++        for (size_t i = 0; i < images; i++) {
++            uint8_t fp[32] = {0};
++            fp[0] = (uint8_t)i;
++            fp[1] = (uint8_t)(i >> 8);
++            ds4_vision_embedding out = {0};
++            if (server_image_cache_get(&cache, fp, &out)) {
++                ds4_vision_embedding_free(&out);
++                continue;
++            }
++            encodes++;
++            float *data = malloc(entry_bytes);
++            TEST_ASSERT(data != NULL);
++            memset(data, 0, entry_bytes);
++            ds4_vision_embedding src = {.data = data, .token_count = tokens};
++            server_image_cache_put(&cache, fp, &src, dim, tight);
++        }
++        if (round == 0) first_round_encodes = encodes;
++        if (round == 2) steady_encodes = encodes;
++        TEST_ASSERT(cache.bytes <= tight);
++    }
++    TEST_ASSERT(first_round_encodes == images);
++    TEST_ASSERT(steady_encodes == images);   /* never recovers: the thrash is permanent */
++    server_image_cache_clear(&cache);
++
++    /* Budget that fits the same set: encode once, then nothing. */
++    const size_t roomy = entry_bytes * images;
++    size_t warm = 0, after = 0;
++    for (size_t round = 0; round < 3; round++) {
++        size_t encodes = 0;
++        for (size_t i = 0; i < images; i++) {
++            uint8_t fp[32] = {0};
++            fp[0] = (uint8_t)i;
++            fp[1] = (uint8_t)(i >> 8);
++            ds4_vision_embedding out = {0};
++            if (server_image_cache_get(&cache, fp, &out)) {
++                ds4_vision_embedding_free(&out);
++                continue;
++            }
++            encodes++;
++            float *data = malloc(entry_bytes);
++            TEST_ASSERT(data != NULL);
++            memset(data, 0, entry_bytes);
++            ds4_vision_embedding src = {.data = data, .token_count = tokens};
++            server_image_cache_put(&cache, fp, &src, dim, roomy);
++        }
++        if (round == 0) warm = encodes;
++        if (round == 2) after = encodes;
++    }
++    TEST_ASSERT(warm == images);
++    TEST_ASSERT(after == 0);
++    TEST_ASSERT(cache.bytes == roomy);
++    server_image_cache_clear(&cache);
++}
++
++static void test_vision_cache_mb_option(void) {
++    char *default_argv[] = {"ds4-server"};
++    server_config defaults = parse_options(1, default_argv);
++    TEST_ASSERT(defaults.vision_cache_mb == 1024);   /* literal: see below */
++
++    char *custom_argv[] = {"ds4-server", "--vision-cache-mb", "4096"};
++    server_config custom = parse_options(3, custom_argv);
++    TEST_ASSERT(custom.vision_cache_mb == 4096);
++
++    char *off_argv[] = {"ds4-server", "--vision-cache-mb", "0"};
++    server_config off = parse_options(3, off_argv);
++    TEST_ASSERT(off.vision_cache_mb == 0);
++
++    /* The literals above are deliberate: an assertion written against
++     * SERVER_IMAGE_CACHE_DEFAULT_MB stays green when the default is lowered
++     * back to the value that caused the 2026-11-14 thrash. This is that
++     * regression: the shipped default must hold the working set that failed,
++     * 15 images of 1000 tokens at 2560-wide fp32. */
++    const size_t set_bytes = 15 * 1000u * 2560u * sizeof(float);
++    TEST_ASSERT((size_t)defaults.vision_cache_mb * 1024u * 1024u >= set_bytes);
++    TEST_ASSERT(SERVER_IMAGE_CACHE_ENTRIES >= 15);
++
++    /* 0 must mean "do not cache", not "cache everything". */
++    server_image_cache cache = {0};
++    uint8_t fp[32] = {0};
++    fp[0] = 9;
++    float data[2] = {1.f, 2.f};
++    ds4_vision_embedding src = {.data = data, .token_count = 1};
++    server_image_cache_put(&cache, fp, &src, 2, 0);
++    TEST_ASSERT(cache.bytes == 0);
++}
++
+ static void test_deepseek41_server_stream(void) {
+     const char *raw = "Plan.</think>\n\n" DS41_TOOL_CALLS_START "\n"
+         DS41_INVOKE_START " name=\"write\">\n"
+@@ -25336,6 +25476,8 @@ static void ds4_server_unit_tests_run(void) {
+     test_anthropic_tool_image_output();
+     test_responses_tool_image_output();
+     test_server_image_embedding_cache();
++    test_server_image_embedding_cache_thrash();
++    test_vision_cache_mb_option();
+     test_batched_prefill_round_robin();
+     test_mixed_prefill_quantum_option();
+     test_multimodal_prefill_resume_frontier();

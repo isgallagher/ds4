@@ -1,0 +1,707 @@
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index 3529223..d582f4d 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -725,6 +725,79 @@ void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+     ds4_tokens_free(&suffix);
+ }
+ 
++/* Tokenize prompt_text[from, to) into `prompt`.  The window is copied because
++ * the tokenizer takes a NUL-terminated string. */
++static void kv_tokenize_window(ds4_engine *engine, const char *prompt_text,
++                               size_t from, size_t to, ds4_tokens *prompt) {
++    if (to <= from) return;
++    char *text = kv_xmalloc(to - from + 1);
++    memcpy(text, prompt_text + from, to - from);
++    text[to - from] = '\0';
++    ds4_tokenize_rendered_chat(engine, text, prompt);
++    free(text);
++}
++
++bool ds4_kvstore_build_prompt_with_vision_suffix(
++        ds4_engine *engine,
++        const ds4_tokens *exact_prefix,
++        const char *prompt_text,
++        size_t suffix_off,
++        ds4_kvstore_vision_tail *tail,
++        ds4_tokens *out) {
++    if (!prompt_text || !tail || !tail->images || tail->count < 0) return false;
++    const size_t total = strlen(prompt_text);
++    if (suffix_off > total) return false;
++
++    ds4_tokens prompt = {0};
++    ds4_tokens_copy(&prompt, exact_prefix);
++    size_t cursor = suffix_off;
++    bool ok = true;
++    for (int i = 0; i < tail->count; i++) {
++        ds4_kvstore_vision_tail_image *im = &tail->images[i];
++        im->in_tail = false;
++        im->ok = false;
++        im->new_start = 0;
++        /* Inside the payload: those rows are already in the session at the
++         * position the trailer identity was verified against. */
++        if (im->marker_off < suffix_off) continue;
++        if (im->marker_off < cursor || im->marker_bytes == 0 ||
++            im->marker_off + im->marker_bytes > total || !im->source)
++            { ok = false; break; }
++        /* Literal text must not impersonate an image: the key masked exactly
++         * this run to \036, so anything else means the offsets and the text
++         * disagree and the rebuild would splice rows into the wrong place. */
++        for (size_t b = 0; b < im->marker_bytes; b++) {
++            if (prompt_text[im->marker_off + b] != '\036') { ok = false; break; }
++        }
++        if (!ok) break;
++        kv_tokenize_window(engine, prompt_text, cursor, im->marker_off, &prompt);
++        const size_t bs = im->block_start;
++        const size_t rows = im->block_rows;
++        /* The span records the first pad, so the tail carries the full vision
++         * block: the token before it, the rows, and the closing token.  Same
++         * shape the live tier splices (build_live_prompt_suffix). */
++        if (bs < 1 || bs + rows >= (size_t)im->source->len) { ok = false; break; }
++        ds4_tokens_push(&prompt, im->source->v[bs - 1]);
++        im->new_start = (size_t)prompt.len;
++        for (size_t p = bs; p <= bs + rows; p++) ds4_tokens_push(&prompt, im->source->v[p]);
++        im->in_tail = true;
++        im->ok = true;
++        cursor = im->marker_off + im->marker_bytes;
++    }
++    if (ok) kv_tokenize_window(engine, prompt_text, cursor, total, &prompt);
++    if (!ok) {
++        for (int i = 0; i < tail->count; i++) {
++            tail->images[i].in_tail = false;
++            tail->images[i].ok = false;
++        }
++        ds4_tokens_free(&prompt);
++        return false;
++    }
++    ds4_tokens_free(out);
++    *out = prompt;
++    return true;
++}
++
+ int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens) {
+     const int trim = kc->opt.boundary_trim_tokens;
+     const int align = kc->opt.boundary_align_tokens;
+@@ -1509,6 +1582,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
+     }
+     char err[160] = {0};
+     int loaded = 0;
++    bool tail_rebuild_failed = false;
+     /* The trailer authenticates a payload *before* any of it becomes live
+      * state.  A checkpoint this request cannot match is a miss and is never
+      * discarded: it stays exactly right for the request that wrote it.  The
+@@ -1545,13 +1619,43 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
+                 size_t suffix_off = ds4_kvstore_text_suffix_offset(
+                     cached_text, prompt_text, text_bytes, hdr.ext_flags,
+                     loaded_tokens, ds4_token_eos(engine), ds4_engine_is_qwen4(engine));
+-                ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+-                    engine, loaded_tokens, prompt_text + suffix_off,
+-                    effective_prompt);
++                if (hooks && hooks->vision_tail) {
++                    /* Multimodal: the suffix carries image markers, and a text
++                     * tokenizer turns each into a few literal tokens instead of
++                     * the placeholder rows the payload's KV rows came from.  A
++                     * prompt short by those rows is what the engine then refuses
++                     * with "image span does not cover image placeholder
++                     * tokens" -- measured 2026-11-14 19:28:13 as a 500 to the
++                     * client and a destroyed checkpoint.  Refuse the load here
++                     * instead: a miss, never a discard, because the file is
++                     * still exactly right for the request that wrote it. */
++                    if (!ds4_kvstore_build_prompt_with_vision_suffix(
++                            engine, loaded_tokens, prompt_text, suffix_off,
++                            hooks->vision_tail, effective_prompt)) {
++                        tail_rebuild_failed = true;
++                    }
++                } else {
++                    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
++                        engine, loaded_tokens, prompt_text + suffix_off,
++                        effective_prompt);
++                }
+             }
+-            if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
++            if (tail_rebuild_failed) {
++                ds4_session_invalidate(session);
++                loaded = 0;
++            } else if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
+                 hooks->load(hooks->ud, fp, hooks->load_wanted);
+             }
++            if (tail_rebuild_failed) {
++                kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                        "%s: kv cache vision tail refused%s%s tokens=%d images=%d file=%s",
++                        kv_log_name(kc),
++                        responses_protocol ? " " : "",
++                        responses_protocol ? "RESPPROTO" : "",
++                        (int)hdr.tokens,
++                        hooks && hooks->vision_tail ? hooks->vision_tail->count : 0,
++                        path);
++            }
+         } else {
+             ds4_session_invalidate(session);
+             unlink(path);
+diff --git a/ds4_kvstore.h b/ds4_kvstore.h
+index 5d9ff9c..54a469c 100644
+--- a/ds4_kvstore.h
++++ b/ds4_kvstore.h
+@@ -99,6 +99,32 @@ typedef struct {
+     bool reject_different_quant;
+ } ds4_kvstore_eviction_context;
+ 
++/* One image of the incoming request, described the way the loader needs it.
++ * A multimodal prompt carries each image as a short request-local marker, and
++ * the disk key is that text with every marker masked to \036, so marker_off
++ * is an offset in the *normalized* text the lookup used -- normalization
++ * preserves byte offsets, so the same offset is valid in the raw text too.
++ * An image whose marker sits before the cached prefix is already inside the
++ * payload and is left alone; one that sits after it must be spliced from the
++ * request's own prompt tokens, because tokenizing the marker text yields a
++ * few literal tokens instead of the placeholder rows the KV rows came from. */
++typedef struct {
++    size_t marker_off;
++    size_t marker_bytes;
++    const ds4_tokens *source;   /* the request's real prompt tokens */
++    size_t block_start;         /* index in source of the first placeholder row */
++    size_t block_rows;          /* placeholder row count */
++    /* Out. */
++    size_t new_start;           /* index in the rebuilt prompt of the first row */
++    bool in_tail;               /* the marker sat in the suffix and was spliced */
++    bool ok;                    /* the splice produced a block for this image */
++} ds4_kvstore_vision_tail_image;
++
++typedef struct {
++    ds4_kvstore_vision_tail_image *images;
++    int count;
++} ds4_kvstore_vision_tail;
++
+ typedef struct {
+     void *ud;
+     uint8_t ext_flag;
+@@ -118,6 +144,11 @@ typedef struct {
+      * ext_flag.  A section the host locates by its own framing does not need
+      * one, but the log and the eviction probes read these bits. */
+     uint8_t extra_ext_flags;
++    /* Multimodal load only: the images of the incoming request, in prompt
++     * order, so the loader can splice the placeholder rows of the ones that
++     * follow the cached prefix instead of tokenizing their marker text.  NULL
++     * keeps the text-only rebuild. */
++    ds4_kvstore_vision_tail *vision_tail;
+ } ds4_kvstore_trailer_hooks;
+ 
+ typedef struct {
+@@ -158,6 +189,19 @@ void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+         const ds4_tokens *exact_prefix,
+         const char *suffix_text,
+         ds4_tokens *out);
++/* The multimodal rebuild: the payload's exact tokens, the request's suffix
++ * text, and every image marker in that suffix replaced by the request's real
++ * placeholder rows (the same shape the live tier builds).  Returns false when
++ * a block cannot be spliced or a marker offset is not the masked run it
++ * claims to be, so the caller treats the load as a miss instead of publishing
++ * a prompt that is short by every image row it skipped. */
++bool ds4_kvstore_build_prompt_with_vision_suffix(
++        ds4_engine *engine,
++        const ds4_tokens *exact_prefix,
++        const char *prompt_text,
++        size_t suffix_off,
++        ds4_kvstore_vision_tail *tail,
++        ds4_tokens *out);
+ 
+ int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens);
+ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
+diff --git a/ds4_server.c b/ds4_server.c
+index 299a274..709da18 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -11722,7 +11722,7 @@ static bool kv_vision_section_write(const kv_store_ctx *ctx, FILE *fp,
+  * match, positions included: the disk tier does not rebase, and a payload
+  * whose rows sit at different positions than the request's spans is a miss. */
+ static bool kv_vision_section_verify(FILE *fp, uint64_t trailer_start,
+-                                     uint64_t file_size,
++                                     uint64_t file_size, uint32_t frontier_tokens,
+                                      const kv_vision_verify *want) {
+     if (!want) return false;
+     /* No room for a footer is no identity.  That is only loadable by a request
+@@ -11758,19 +11758,18 @@ static bool kv_vision_section_verify(FILE *fp, uint64_t trailer_start,
+         (uint64_t)KV_VISION_SECTION_HEADER + (uint64_t)count * KV_VISION_RECORD +
+             KV_VISION_FOOTER != (uint64_t)total)
+         return false;
+-    if (count != want->image_count || covered > count) return false;
+-    /* The frontier must cover EVERY image the request names.  The disk tier
+-     * rebuilds the tail by tokenizing the text after the cached prefix, and
+-     * image markers in that tail tokenize to a handful of tokens instead of
+-     * the thousand placeholder rows the prompt really holds -- the effective
+-     * prompt comes out short and the sync fails with "image span does not
+-     * cover image placeholder tokens".  Measured 2026-11-14 19:28:13: a hit at
+-     * 32,768 built ctx=32768..292451 for a 307,893-token prompt, the client got
+-     * a 500, and the payload was discarded.  Serving a request that appends an
+-     * image needs the live tier's splice helper in this path, which is stage 2;
+-     * until then an uncovered image is a miss, which is the slow turn, not a
+-     * broken one. */
+-    if (covered != count) return false;
++    if (count > want->image_count || covered != count) return false;
++    /* The checkpoint must cover every image it names.  It used to also have to
++     * cover every image the *request* names, because the disk tier rebuilt the
++     * tail by tokenizing the text after the cached prefix and image markers in
++     * that tail tokenize to a handful of tokens instead of the thousand
++     * placeholder rows the prompt really holds -- measured 2026-11-14 19:28:13,
++     * where a hit at 32,768 built ctx=32768..292451 for a 307,893-token prompt,
++     * the client got a 500, and the payload was discarded.  The loader now
++     * splices those rows the way the live tier does
++     * (ds4_kvstore_build_prompt_with_vision_suffix), so a request may bring
++     * images the file never saw, as long as each one starts at or after the
++     * frontier the loader is about to continue from. */
+     for (uint32_t i = 0; i < count; i++) {
+         uint8_t rec[KV_VISION_RECORD];
+         if (fread(rec, 1, sizeof(rec), fp) != sizeof(rec)) return false;
+@@ -11780,6 +11779,11 @@ static bool kv_vision_section_verify(FILE *fp, uint64_t trailer_start,
+             memcmp(rec + 8, sp->embedding.fingerprint, 32) != 0)
+             return false;
+     }
++    /* An image that starts before the frontier belongs to the payload's rows,
++     * and this file does not name it, so its rows are unaccounted for: reject.
++     * An image at or after it is the splice's job. */
++    for (uint32_t i = count; i < (uint32_t)want->image_count; i++)
++        if (want->images[i].token_start < frontier_tokens) return false;
+     if (want->covered_out) *want->covered_out = covered;
+     return true;
+ }
+@@ -11846,7 +11850,8 @@ static bool kv_cache_vision_verify_cb(void *ud, FILE *fp,
+     if (hdr->ext_flags & DS4_KVSTORE_EXT_VISION_IDENTITY) {
+         /* Fail closed: the bit promises an identity, so an unreadable one is a
+          * reject even for a request with no images. */
+-        ok = kv_vision_section_verify(fp, trailer_start, file_size, want);
++        ok = kv_vision_section_verify(fp, trailer_start, file_size,
++                                      hdr->tokens, want);
+     } else {
+         ok = want && want->image_count == 0;
+     }
+@@ -11928,7 +11933,8 @@ static void kv_cache_maybe_store_prompt_tail(server *s, server_slot *slot,
+                                         int cold_saved_tokens) {
+     if (!s->prompt_tail_cache || !s->kv.enabled ||
+         !ds4_engine_is_qwen4(s->engine) || req->api != API_RESPONSES ||
+-        req->image_count || !req->prompt_text || !req->prompt_text[0] ||
++        req->image_count > SERVER_MAX_IMAGES ||
++        !req->prompt_text || !req->prompt_text[0] ||
+         !prompt || prompt->len < s->kv.opt.min_tokens) return;
+     /* Only frontiers known to belong to this request count as coverage.
+      * The slot's periodic counter can belong to a different disk-hit branch. */
+@@ -11936,10 +11942,27 @@ static void kv_cache_maybe_store_prompt_tail(server *s, server_slot *slot,
+     uint32_t chunk = ds4_engine_prefill_chunk(s->engine);
+     if (!chunk || covered < 0 || prompt->len <= covered ||
+         (uint32_t)(prompt->len - covered) < chunk) return;
++    /* A multimodal prompt is keyed by its text with every image marker masked
++     * to \036 -- the normalization the live tiers already use and the load side
++     * reproduces.  The raw text cannot serve as a key: the marker carries a
++     * request-local nonce, so this turn's text is never a byte prefix of the
++     * next, and a token decode is not the client's marker either.  The trailer
++     * identity names the images these rows came from, and a later request that
++     * appends an image splices that image's rows in at load time. */
++    char *normalized = NULL;
++    const char *key_text = req->prompt_text;
++    if (req->image_count) {
++        visible_image_key vimages;
++        normalized = visible_prompt_key(req, req->prompt_text, &vimages);
++        if (!normalized) return;
++        key_text = normalized;
++    }
+     (void)kv_cache_store_live_prefix_text(s, slot, prompt, prompt->len,
+-                                         "near-tail", req->prompt_text,
++                                         "near-tail", key_text,
+                                          KV_EXT_RESPONSES_VISIBLE,
+-                                         "responses-prompt", false);
++                                         "responses-prompt",
++                                         req->image_count != 0);
++    free(normalized);
+ }
+ 
+ /* Select the disk key for the slot's current live checkpoint.  Returns the
+@@ -12148,6 +12171,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
+                                   const char *prompt_text,
+                                   const ds4_vision_span *images,
+                                   size_t image_count,
++                                  ds4_kvstore_vision_tail *vision_tail,
+                                   ds4_tokens *effective_prompt,
+                                   char **loaded_path_out,
+                                   uint8_t *loaded_ext_flags_out,
+@@ -12162,6 +12186,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
+         .images = images, .image_count = image_count, .covered_out = &covered,
+     };
+     ds4_kvstore_trailer_hooks hooks = kv_cache_store_hooks(&ctx, NULL, &want);
++    hooks.vision_tail = vision_tail;
+     pthread_mutex_lock(&s->inference_mu);
+     /* Discard any vision state this slot held before the loader replaces it:
+      * the next sync must not read the old spans as a match for the fresh
+@@ -12191,17 +12216,80 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
+     return loaded;
+ }
+ 
+-static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
++static int kv_cache_try_load(server *s, server_slot *slot, request *req,
+                              ds4_tokens *effective_prompt,
+                              char **loaded_path_out,
+                              uint8_t *loaded_ext_flags_out) {
+-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
+-                                  req ? req->images : NULL,
+-                                  req ? req->image_count : 0,
+-                                  effective_prompt,
+-                                  loaded_path_out,
+-                                  loaded_ext_flags_out,
+-                                  req && req->api == API_RESPONSES);
++    if (!req) return 0;
++    const char *key_text = req->prompt_text;
++    char *normalized = NULL;
++    ds4_kvstore_vision_tail_image tail_imgs[SERVER_MAX_IMAGES];
++    ds4_kvstore_vision_tail tail = {0};
++    memset(tail_imgs, 0, sizeof(tail_imgs));
++    if (req->image_count) {
++        /* The key a vision request can be found by is its own prompt text with
++         * every image marker masked to \036.  A marker carries a request-local
++         * nonce, so one turn's raw text is never a byte prefix of the next, and
++         * the token decode the store would otherwise use is not the client's
++         * marker either.  Normalization preserves byte offsets, so the suffix
++         * offset the loader computes in normalized space is valid in raw space
++         * too -- the visible live tier already relies on that. */
++        visible_image_key vimages;
++        normalized = visible_prompt_key(req, req->prompt_text, &vimages);
++        if (!normalized) return 0;
++        key_text = normalized;
++        tail.images = tail_imgs;
++        tail.count = (int)req->image_count;
++        for (size_t i = 0; i < req->image_count; i++) {
++            tail_imgs[i].marker_off = vimages.offsets[i];
++            tail_imgs[i].marker_bytes = strlen(req->image_markers[i]);
++            tail_imgs[i].source = &req->prompt;
++            tail_imgs[i].block_start = req->images[i].token_start;
++            tail_imgs[i].block_rows = req->images[i].embedding.token_count;
++        }
++    }
++    int loaded = kv_cache_try_load_text(s, slot, key_text, req->images,
++                                        req->image_count,
++                                        req->image_count ? &tail : NULL,
++                                        effective_prompt, loaded_path_out,
++                                        loaded_ext_flags_out,
++                                        req->api == API_RESPONSES);
++    if (loaded > 0 && req->image_count) {
++        /* The consequence 0016 never asserted: a spliced prompt carries the
++         * placeholder rows, so it cannot be shorter than its frontier plus the
++         * blocks it took from the request.  A prompt short by those rows is what
++         * the engine refused with "image span does not cover image placeholder
++         * tokens" -- a 500 to the client and a destroyed checkpoint.  Refuse the
++         * load instead: the turn rebuilds, and the file stays for a request
++         * whose positions do line up. */
++        size_t spliced_rows = 0;
++        for (size_t i = 0; i < req->image_count; i++)
++            if (tail_imgs[i].in_tail) spliced_rows += tail_imgs[i].block_rows + 2;
++        if ((size_t)effective_prompt->len < (size_t)loaded + spliced_rows) {
++            server_log(DS4_LOG_KVCACHE,
++                       "ds4-server: kv cache vision frontier rejected prompt=%d frontier=%d spliced_rows=%zu",
++                       effective_prompt->len, loaded, spliced_rows);
++            pthread_mutex_lock(&s->inference_mu);
++            ds4_session_invalidate(slot->session);
++            pthread_mutex_unlock(&s->inference_mu);
++            ds4_tokens_free(effective_prompt);
++            if (loaded_path_out && *loaded_path_out) {
++                free(*loaded_path_out);
++                *loaded_path_out = NULL;
++            }
++            if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
++            loaded = 0;
++        } else {
++            /* A spliced image sits where the rebuild put it, and that is the
++             * position the sync must be told -- the write-back the live tier
++             * already does for a live continuation. */
++            for (size_t i = 0; i < req->image_count; i++)
++                if (tail_imgs[i].in_tail)
++                    req->images[i].token_start = (uint32_t)tail_imgs[i].new_start;
++        }
++    }
++    free(normalized);
++    return loaded;
+ }
+ 
+ /* A text-only suffix tokenizer would turn image markers into literal text.
+@@ -14029,6 +14117,13 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
+         int loaded = kv_cache_try_load_text(s, slot,
+                                             rendered.ptr ? rendered.ptr : "",
+                                             j->req.images, j->req.image_count,
++                                            /* No splice here: this key is a
++                                             * canonical re-render, and a vision
++                                             * checkpoint is keyed by the
++                                             * marker-masked prompt text, so a
++                                             * multimodal tool turn stays the
++                                             * plain miss it was before. */
++                                            NULL,
+                                             &effective, &path, NULL, false);
+         if (loaded == 0) {
+             pthread_mutex_lock(&s->inference_mu);
+@@ -14668,19 +14763,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+          * instead of rebuilding from zero. */
+         kv_cache_store_current(s, slot, "evict", false);
+     }
+-    /* Re-closed for multimodal by 0018.  The token-text disk key is a decode
+-     * of the stored token ids (ds4_kvstore_render_tokens_text -> per-token
+-     * ds4_token_text), and an image placeholder token decodes to its own text,
+-     * not to the client's marker with its request-local nonce.  So no
+-     * checkpoint that spans an image can ever byte-match a later request, and
+-     * the ladder only ever produced pre-image files that 0017 then rejects on
+-     * coverage.  Measured 2026-11-14 19:56: the turn stored a 9.5 GiB frontier
+-     * at 19:55 and the resume two lines later could only find the 32,768-token
+-     * file, took `identity miss`, and rebuilt all 307,893 tokens -- 20+ GiB of
+-     * writes per turn, a store at 233 of 240 GiB, and a prefill rate that fell
+-     * from 884 t/s to 527 t/s.  Opening this again needs the marker-normalized
+-     * key and the tail splice, not just the identity. */
+-    if (!multimodal && cached == 0) {
++    /* The disk tier is open to vision now, and it is open because two things
++     * changed together, not one.  (1) The key: a multimodal request looks
++     * itself up by its prompt text with every image marker masked to \036, the
++     * same normalization the live tiers use.  The token-text key this site used
++     * to depend on is a decode of the stored token ids, and an image
++     * placeholder token decodes to its own text, never to the client's marker
++     * with its request-local nonce -- so no checkpoint spanning an image could
++     * ever byte-match a later request, and the ladder only produced pre-image
++     * files.  (2) The tail: the loader splices each image after the frontier
++     * from the request's own prompt rows instead of tokenizing its marker, so
++     * the rebuilt prompt holds the rows the payload's attention depends on.
++     * Both were required; 0016 shipped the identity alone and gave the client a
++     * 500 (measured 2026-11-14 19:28:13, 15,442 tokens of image rows missing),
++     * and the ladder that shipped with it wrote 20+ GiB a turn into a store at
++     * 233/240 GiB and cut prefill from 884 t/s to 527 t/s.  The ladder stays
++     * closed for vision: only the completed prompt frontier is written, under
++     * the bounded near-tail pool that refuses instead of evicting. */
++    if (cached == 0) {
+         /* A forked visible-keyed payload no longer ends the disk tier.
+          * Discarding it stays (0007's protection: the forked text is a byte
+          * prefix of every later render of this conversation, so keeping it
+@@ -14724,7 +14824,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+                  * conversation keeps the slot long enough to converge. */
+                 if (responses_fork_heal &&
+                     (disk_cache_ext_flags & (KV_EXT_RESPONSES_VISIBLE |
+-                                             KV_EXT_THINKING_VISIBLE))) {
++                                             KV_EXT_THINKING_VISIBLE)) &&
++                    /* A payload that names its images was keyed by this
++                     * request's own full rendered prompt text (masked), not by a
++                     * visible transcript, and its frontier may have been set by
++                     * an earlier splice.  Ids differ at a splice boundary by
++                     * design -- the reason a token-text payload is not guarded
++                     * either -- and the trailer identity is the stronger proof
++                     * here: positions, row counts and pixel fingerprints were
++                     * just verified against this request. */
++                    !(disk_cache_ext_flags & DS4_KVSTORE_EXT_VISION_IDENTITY)) {
+                     pthread_mutex_lock(&s->inference_mu);
+                     const int loaded_common =
+                         ds4_session_common_prefix(slot->session, &j->req.prompt);
+@@ -14969,7 +15078,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+                                              cold_store_len);
+         }
+     }
+-    if (!multimodal) kv_cache_maybe_store_prompt_tail(s, slot, &j->req, prompt_for_sync, cached, cold_saved ? cold_store_len : 0);
++    kv_cache_maybe_store_prompt_tail(s, slot, &j->req, prompt_for_sync, cached, cold_saved ? cold_store_len : 0);
+     char id[96];
+     responses_random_id(id, sizeof(id),
+                         j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
+@@ -25832,11 +25941,10 @@ static void test_vision_identity_trailer(void) {
+     kv_vision_verify want = { .images = spans, .image_count = 2,
+                               .covered_out = &got };
+     TEST_ASSERT(kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
+-                                        &want));
++                                        2096, &want));
+     TEST_ASSERT(got == 2);
+-    /* A frontier that leaves an image uncovered must never be loaded: the
+-     * rebuilt tail would tokenize that image's marker text instead of its
+-     * placeholder rows. */
++    /* A checkpoint that does not cover every image it names must never be
++     * loaded: its payload holds rows of an image the identity cannot name. */
+     ctx.covered = 1;
+     uint64_t partial_bytes = 0;
+     FILE *fp_partial = tmpfile();
+@@ -25845,7 +25953,8 @@ static void test_vision_identity_trailer(void) {
+     TEST_ASSERT(fseeko(fp_partial, 0, SEEK_END) == 0);
+     got = 99;
+     TEST_ASSERT(!kv_vision_section_verify(fp_partial, 0,
+-                                         (uint64_t)ftell(fp_partial), &want));
++                                         (uint64_t)ftell(fp_partial), 2096,
++                                         &want));
+     ctx.covered = 2;
+     fclose(fp_partial);
+ 
+@@ -25856,18 +25965,20 @@ static void test_vision_identity_trailer(void) {
+     got = 99;
+     want.images = other;
+     TEST_ASSERT(!kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
+-                                         &want));
++                                         2096, &want));
+     /* Same pixels, different row count: the spans no longer describe the KV. */
+     memcpy(other, spans, sizeof(other));
+     other[0].embedding.token_count = 65;
+     TEST_ASSERT(!kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
+-                                         &want));
++                                         2096, &want));
+     /* Same pixels, shifted position: the disk tier does not rebase. */
+     memcpy(other, spans, sizeof(other));
+     other[1].token_start = 2001;
+     TEST_ASSERT(!kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
+-                                         &want));
+-    /* One image appended: the frontier's coverage is not what was stored. */
++                                         2096, &want));
++    /* One image appended at or after the frontier: the file covers everything
++     * it names, and the loader splices the new image's rows from the request.
++     * This is the owner's escape shape -- the request 0017 made a miss. */
+     ds4_vision_span three[3];
+     memcpy(three, spans, sizeof(spans));
+     three[2].token_start = 3000;
+@@ -25875,13 +25986,20 @@ static void test_vision_identity_trailer(void) {
+     three[2].embedding.fingerprint[0] = 9;
+     want.images = three;
+     want.image_count = 3;
++    TEST_ASSERT(kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
++                                        2096, &want));
++    /* An appended image that starts *before* the frontier is inside the
++     * payload's rows, and this file never named it: those rows are
++     * unaccounted for, so the load is a reject, not a splice. */
++    three[2].token_start = 2050;
+     TEST_ASSERT(!kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
+-                                         &want));
++                                         2096, &want));
++    three[2].token_start = 3000;
+     want.images = spans;
+     want.image_count = 2;
+     want.covered_out = NULL;
+     TEST_ASSERT(kv_vision_section_verify(fp, trailer_start, (uint64_t)size,
+-                                        &want));
++                                        2096, &want));
+     fclose(fp);
+ 
+     /* A file with no section at all: the shape every checkpoint written before
+diff --git a/tests/test_kvstore_near_tail.c b/tests/test_kvstore_near_tail.c
+index a52c513..ccbc1bf 100644
+--- a/tests/test_kvstore_near_tail.c
++++ b/tests/test_kvstore_near_tail.c
+@@ -460,6 +460,129 @@ int main(void){
+     for(int i=0;i<k.len;i++)assert(!unlink(k.entry[i].path));
+     ds4_kvstore_close(&k);
+     assert(!rmdir(fixture_dir));
++    /* ---- The vision tail: the consequence 0016 never asserted.
++     * A vision checkpoint loaded by a request that appends an image must put
++     * that image's placeholder rows into the rebuilt prompt. Tokenizing the
++     * marker instead is the defect the owner hit on 2026-11-14 19:28:13: a
++     * 32,768-token payload plus a tokenized tail came out 15,442 tokens short
++     * of the 307,893-token prompt, the engine refused the sync ("image span
++     * does not cover image placeholder tokens"), the client got a 500 and the
++     * payload was discarded. Here the shortfall is a number, and it is red. */
++    {
++        char vdir[256];
++        strcpy(vdir,"/tmp/ds4-kvstore-vision-XXXXXX");
++        assert(mkdtemp(vdir));
++        /* The mock session stages every payload into fixture_dir, which the
++         * section above removed on cleanup. Recreate it for this section and
++         * remove it again at the end. */
++        assert(!mkdir(fixture_dir,0700));
++        ds4_kvstore vk={0};
++        assert(ds4_kvstore_open(&vk,vdir,1,false,opt,"kvstore-vision",NULL,NULL));
++        ds4_session vs={0};
++        for(int i=0;i<512;i++)ds4_tokens_push(&vs.tokens,i%26);
++        memcpy(vs.state,state,sizeof(state));
++        /* Normalized prompt text: each image marker masked to \036, byte
++         * offsets preserved. The mock tokenizer yields one token per byte, so
++         * every length below is exact and the assertion is arithmetic. */
++        const char m4[5]={'\036','\036','\036','\036','\0'};
++        char stored[64],full[64],bad[64];
++        snprintf(stored,sizeof(stored),"prefix%s",m4);            /* 10 bytes */
++        snprintf(full,sizeof(full),"prefix%sab%scd",m4,m4);   /* 18 bytes */
++        assert(store(&vk,&e,&vs,stored,"near-tail"));
++        char *vpath=key_path(&vk,stored);
++        /* The request's real prompt tokens; image 1's block is v[4] then
++         * v[5..12] = 9 tokens for 7 placeholder rows. */
++        ds4_tokens src={0};
++        for(int i=0;i<32;i++)ds4_tokens_push(&src,i+100);
++        ds4_kvstore_vision_tail_image imgs[2]={0};
++        for(int i=0;i<2;i++){
++            imgs[i].marker_bytes=4;
++            imgs[i].source=&src;
++            imgs[i].block_start=5;
++            imgs[i].block_rows=7;
++        }
++        imgs[0].marker_off=6;    /* inside the payload: left alone */
++        imgs[1].marker_off=12;   /* in the suffix: spliced */
++        ds4_kvstore_vision_tail tail={.images=imgs,.count=2};
++        ds4_kvstore_trailer_hooks hk={0};
++        hk.vision_tail=&tail;
++        ds4_tokens eff={0};
++        ds4_kvstore_load_result lr={0};
++        ds4_session vs2={0};
++        int got=ds4_kvstore_try_load_text(&vk,&e,&vs2,full,&eff,&lr,&hk,false);
++        assert(got==512);
++        /* 512 payload + "ab" + the 9-token block + "cd". */
++        assert(eff.len==512+2+9+2);
++        assert(imgs[0].in_tail==false);
++        assert(imgs[1].in_tail==true);
++        assert(imgs[1].new_start==(size_t)(512+2+1));   /* after the block's leading token */
++        /* The rows are really in the prompt, at the position the request will
++         * be told about: the token before the span, then the placeholder rows. */
++        assert(eff.v[imgs[1].new_start-1]==src.v[4]);
++        for(int i=0;i<=7;i++)assert(eff.v[imgs[1].new_start+i]==src.v[5+i]);
++        /* The same load without the splice is exactly the defect: the marker
++         * becomes four literal tokens and the prompt is short by the rows. */
++        ds4_tokens plain={0};
++        ds4_kvstore_load_result lr2={0};
++        ds4_session vs3={0};
++        assert(ds4_kvstore_try_load_text(&vk,&e,&vs3,full,&plain,&lr2,NULL,false)==512);
++        assert(plain.len==512+8);
++        assert(eff.len>plain.len);
++        ds4_tokens_free(&eff);
++        ds4_tokens_free(&plain);
++        ds4_kvstore_load_result_free(&lr);
++        ds4_kvstore_load_result_free(&lr2);
++        /* A run that is not the mask is not an image: refuse the load, keep the
++         * file -- it is still exactly right for the request that wrote it. */
++        strcpy(bad,stored);
++        strcat(bad,"abx");
++        strcat(bad,"\036\036\036");
++        strcat(bad,"cd");
++        ds4_kvstore_vision_tail_image one[2]={0};
++        memcpy(one,imgs,sizeof(one));
++        ds4_kvstore_vision_tail badtail={.images=one,.count=2};
++        ds4_kvstore_trailer_hooks bh={0};
++        bh.vision_tail=&badtail;
++        ds4_tokens eff3={0};
++        ds4_kvstore_load_result lr3={0};
++        ds4_session vs4={0};
++        assert(ds4_kvstore_try_load_text(&vk,&e,&vs4,bad,&eff3,&lr3,&bh,false)==0);
++        struct stat keep;
++        assert(!stat(vpath,&keep));
++        /* A block that would read past the request's prompt is refused the same
++         * way; the payload is never published with a truncated image. */
++        ds4_kvstore_vision_tail_image far[2]={0};
++        memcpy(far,imgs,sizeof(far));
++        far[1].block_start=30;
++        far[1].block_rows=7;
++        ds4_kvstore_vision_tail fartail={.images=far,.count=2};
++        ds4_kvstore_trailer_hooks fh={0};
++        fh.vision_tail=&fartail;
++        ds4_tokens eff4={0};
++        ds4_kvstore_load_result lr4={0};
++        ds4_session vs5={0};
++        assert(ds4_kvstore_try_load_text(&vk,&e,&vs5,full,&eff4,&lr4,&fh,false)==0);
++        assert(!stat(vpath,&keep));
++        free(vpath);
++        ds4_tokens_free(&src);
++        ds4_tokens_free(&vs.tokens);
++        kv_cache_refresh(&vk);
++        for(int i=0;i<vk.len;i++)assert(!unlink(vk.entry[i].path));
++        ds4_kvstore_close(&vk);
++        DIR *vd=opendir(vdir);
++        assert(vd);
++        struct dirent *vde;
++        while((vde=readdir(vd))){
++            if(!strcmp(vde->d_name,".")||!strcmp(vde->d_name,".."))continue;
++            char *p=malloc(strlen(vdir)+strlen(vde->d_name)+2);
++            sprintf(p,"%s/%s",vdir,vde->d_name);
++            assert(!unlink(p));
++            free(p);
++        }
++        closedir(vd);
++        assert(!rmdir(vdir));
++        assert(!rmdir(fixture_dir));
++    }
+     /* Policy, no filesystem: the supplementary pool scales with resident
+      * sessions, and a box that never sets the field keeps the single-session
+      * figures exactly. At 240 GiB the eighth-of-budget share binds from three

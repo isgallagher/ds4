@@ -383,11 +383,23 @@ the tested tree, so the collapse changes no code. Then §Verification 1–3 on t
 `ds4_kvstore.c`, `ds4_kvstore.h`, `ds4_server.c` **and** `tests/test_kvstore_near_tail.c`
 vs the tested tree; `ds4_test --server` → `server: OK`, `ds4 tests: ok`; `test-kvstore-near-tail`
 → `PASS` (with the new vision-tail section); `test-qwen-tool-disk-key` → the documented
-`FAIL (8 failures)`, unchanged count. **Step 4 owed for B18:** clear the store, restart the
-vision profile, escape mid-turn and resume with an appended screenshot — expect
-`kv cache hit text … key=responses-visible` at the previous prompt frontier and a short
-prefill, with **no 500, no `kv cache discarded`, no `identity miss` and no
-`kv cache vision tail refused`**, and report the `prompt done` seconds against the 181 s
+`FAIL (8 failures)`, unchanged count. **Step 4 PASSED for the same-images shape 2026-11-14
+22:00** (owner's run, store cleared first, server started 21:47): `21:55:23 kv cache stored
+tokens=307893 trimmed=0 reason=near-tail key=responses-prompt size=10136.63 MiB
+save=4702.0 ms` → `22:00:43 generation cancelled mid-turn live=318864` → `22:00:56 live kv
+cache miss … prompt=307893 common=307893 vision=match reason=token-mismatch` → `22:00:58 kv
+cache hit text RESPPROTO tokens=307893 text=956539 key=responses-visible load=1731.0 ms` →
+**`chat ctx=307893..307893:0 prompt done 0.000s`**, first 50 tokens 1.41 s later — **zero
+tokens prefilled where the same escape cost 307,893 tokens / 583.140 s on 2026-11-14 19:56**,
+with 0 `identity miss`, 0 `vision tail refused`, 0 `vision frontier rejected`, 0 `kv cache
+discarded`, 0 prefill failures and 0 500s in the 1,126-line run. The store went 239 G/43
+files → 96 G/18 files, and the only `continued` ladder stores in the window belong to a text
+conversation on the same server, which is the intended split. **Step 4 still owed for B18:
+the appended-screenshot resume** — the retry's prompt was byte-exact to the frontier (the
+client dropped the escaped partial), so the splice did not run in the field and stands
+unit-proven only. Operator note: the owner's own re-run of `./build.sh` produced a different
+digest (`dfdea3a3…`) from the same commit, because the link is not reproducible — the commit
+and the source byte-identity are the contract, never the digest.
 the bug cost.
 
 ## Swapping the live server onto a fresh build

@@ -245,6 +245,26 @@
 #       always passes, a prepare that accepts a straddling frontier, a verify
 #       that ignores token_start, and a promised-but-missing identity treated as
 #       a miss instead of a reject each turn the suite red).
+#   0017-kv-vision-load-requires-full-image-coverage.patch
+#       Narrows 0016 after the owner's field run 2026-11-14 19:28. A multimodal
+#       request loaded a checkpoint whose frontier covered only some of its
+#       images: `kv cache hit text tokens=32768` then `chat ctx=32768..292451`
+#       for a 307,893-token prompt. The disk tier rebuilds the tail by
+#       tokenizing the text after the cached prefix, and image markers in that
+#       tail tokenize to a few tokens instead of the thousand placeholder rows
+#       the prompt holds, so the engine refused the sync ("image span does not
+#       cover image placeholder tokens"), the client got a 500, and the payload
+#       was discarded as prompt-sync-failed. Now a vision checkpoint loads only
+#       when its frontier covers EVERY image the request names - exactly the
+#       condition under which the rebuilt tail holds no image markers. Serving a
+#       request that APPENDS an image needs the live tier's marker-splice helper
+#       in this path (stage 2); until then that shape is a miss, a slow turn and
+#       not a broken one. The same hook closes a pre-existing hole:
+#       `canonicalize_tool_checkpoint` reached the disk load with no image
+#       identity, so before 0016 a multimodal tool turn could load a text
+#       checkpoint and hit the same corruption. Test: `test_vision_identity_
+#       trailer` gains the uncovered-image case (mutation-checked: deleting the
+#       coverage rule turns the suite red).
 #
 # ARCHIVE: patches/archive/0005-…superseded-by-pr-1206.patch — our FIX-1. The
 # visible-suffix gate change is replaced by #1206's two-key design, which also
@@ -393,6 +413,7 @@ apply patches/0013-responses-cancel-remember-partial-visible.patch
 apply patches/0014-kv-keep-payload-on-cancelled-prefill.patch
 apply patches/0015-vision-embedding-cache-sized-from-flag.patch
 apply patches/0016-kv-vision-identity-in-checkpoint-trailer.patch
+apply patches/0017-kv-vision-load-requires-full-image-coverage.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim

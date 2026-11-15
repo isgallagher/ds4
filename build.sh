@@ -265,6 +265,27 @@
 #       checkpoint and hit the same corruption. Test: `test_vision_identity_
 #       trailer` gains the uncovered-image case (mutation-checked: deleting the
 #       coverage rule turns the suite red).
+#   0018-kv-reclose-vision-disk-tier-until-key-and-tail-are-vision-aware.patch
+#       Re-closes the sites 0016 opened, because the mechanism behind them
+#       cannot work with a text key. The disk key is a decode of the stored
+#       token ids (`ds4_kvstore_render_tokens_text` -> per-token
+#       `ds4_token_text`), and an image placeholder token decodes to its own
+#       text, not to the client's marker with its request-local nonce. So no
+#       checkpoint spanning an image can ever byte-match a later request: the
+#       ladder writes files, and the lookup can only ever reach the ones that
+#       end before the first image -- which 0017 then rejects on coverage.
+#       Measured 2026-11-14 19:55-19:56: the turn stored a 9.5 GiB frontier, the
+#       resume 4 s later found only the 32,768-token file, took `identity miss`,
+#       and rebuilt all 307,893 tokens -- 20+ GiB written per turn, the store at
+#       233 of 240 GiB evicting the text profile's usable checkpoints, and the
+#       prefill rate down from 884 t/s to 527 t/s. Net effect of 0016+0017 on
+#       this workload: no win, real cost. KEPT: the trailer identity format, the
+#       pre-payload `verify` hook, the engine accessors, and the
+#       `canonicalize_tool_checkpoint` identity pass -- that last one closes a
+#       hole that predates 0016 and stays closed. Reopening needs a
+#       marker-normalized key (the `visible_prompt_key` masking is the existing
+#       precedent) AND the tail splice, in one patch, with an end-to-end test
+#       that asserts the rebuilt prompt's token count equals the request's.
 #
 # ARCHIVE: patches/archive/0005-…superseded-by-pr-1206.patch — our FIX-1. The
 # visible-suffix gate change is replaced by #1206's two-key design, which also
@@ -414,6 +435,7 @@ apply patches/0014-kv-keep-payload-on-cancelled-prefill.patch
 apply patches/0015-vision-embedding-cache-sized-from-flag.patch
 apply patches/0016-kv-vision-identity-in-checkpoint-trailer.patch
 apply patches/0017-kv-vision-load-requires-full-image-coverage.patch
+apply patches/0018-kv-reclose-vision-disk-tier-until-key-and-tail-are-vision-aware.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim

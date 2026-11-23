@@ -400,6 +400,19 @@ client dropped the escaped partial), so the splice did not run in the field and 
 unit-proven only. Operator note: the owner's own re-run of `./build.sh` produced a different
 digest (`dfdea3a3…`) from the same commit, because the link is not reproducible — the commit
 and the source byte-identity are the contract, never the digest.
+
+**Eight-day re-check 2026-11-22 (same build, `dfdea3a3…` from `05de09a`, server up since 02:33).**
+Clean on every safety property: since the fix there is **no** `identity miss`, `vision tail
+refused`, `vision frontier rejected`, `kv cache discarded`, prefill failure or 500 anywhere in
+the 12.7 MB vision log — the only ones present are the four misses and the one discard from
+19:22–19:56 on 2026-11-14, before it. **New finding, not a defect in 0017:** the store is back
+at 238 G/34 files and `supplementary admission has no room` has been logged **43 times** (most
+recently 2026-11-22 22:47), with **no near-tail store since 2026-11-18 16:55** — so the vision
+frontier is currently not being written at all. Cause and the three options are documented in
+`docs/RESPONSES_CACHE_MISS.md` §13: `kv_cache_tail_admit()` needs whole-store free space and
+never evicts, while the main pool runs the store to its 240 GiB budget. The cheapest immediate
+answer is `--kv-disk-space-mb` (240 GiB today, 387 GiB free on the volume). **The appended-
+screenshot resume is still owed** — the splice has never run in the field.
 the bug cost.
 
 ## Swapping the live server onto a fresh build

@@ -368,3 +368,89 @@ session invalidation, because a mid-sync session is genuinely not a usable front
 distinction is *who failed*: a forked payload is wrong for the prompt and must be deleted
 (0007/0012); a cancelled prefill is a client that left, and its checkpoint is the cheapest
 recovery for the resend that follows.
+
+## 13. The same escape, four causes later: a vision conversation had no frontier at all (2026-11-14, fixed by patch 0017)
+
+**Symptom, identical to §10.** `^C` mid-turn in the vision profile, resend, and the whole
+prompt re-prefills. Measured 2026-11-14 15:06: `live kv cache miss … live=242039
+prompt=240227 common=240217` → `chat ctx=0..240227` — 99.996 % of the prompt already
+computed and thrown away, ≈ 181 s for a 10-token suffix. Again at 19:56: 307,893 tokens,
+583.140 s. §10's causes (stranded handles, the cancelled-prefill delete) were already fixed
+and were not the cause here.
+
+**Cause.** The disk tier was closed to multimodal by nine `!multimodal` guards, and
+rightly so: a payload holds image-conditioned KV rows that the token text cannot describe.
+So a vision conversation never wrote a checkpoint and never read one — the three-hour log
+has exactly two `kv cache stored` lines, both from the text conversation. The live tier
+cannot rescue this shape either: the cancelled turn leaves the session *past* the request,
+`REUSE_MEMORY_TOKEN` needs `common == live_pos`, and rewind is GLM-only (Qwen's gated
+delta-net state is forward-only). The disk tier is the only residency mechanism this box
+has, so the fix had to be in it.
+
+**What I shipped first, and why it was wrong (patch 0016, withdrawn).** Image identity in
+the checkpoint trailer, verified before the payload is read. That is necessary and it is
+still in the tree — but I called it "stage 1" and shipped it alone, and two other things
+were required in the same patch:
+
+1. **The key.** The disk key was a decode of the stored token ids. An image placeholder
+   token decodes to its own text, never to the client's marker, which carries a
+   request-local nonce — so *no checkpoint spanning an image could ever be found again*.
+   The ladder therefore wrote only pre-image files, at 20+ GiB per turn, into a store at
+   233/240 GiB, and prefill fell from 884 t/s to 527 t/s.
+2. **The tail.** The loader rebuilds the prompt as *payload tokens + tokenized suffix*.
+   An image marker in that suffix tokenizes to a few literal tokens instead of the ~1,000
+   placeholder rows, so the rebuilt prompt came out short by every image it skipped.
+   Measured 19:28:13: a hit at 32,768 built `ctx=32768..292451` for a 307,893-token prompt
+   — 15,442 tokens missing — the engine refused the sync (`image span does not cover image
+   placeholder tokens`), **the client got a 500**, and the failure path deleted a good
+   checkpoint.
+
+The lesson is in the runbook B15/B18 rows and in the vault's design §5: **a gate proven at
+its own boundary is not proven.** The identity framing passed every unit test I wrote; the
+assertion that would have caught it was about the *consumer's* outcome — a prompt whose
+token count adds up — not the serializer's.
+
+**The fix (patch 0017, runbook B18), both halves at once.** (a) A multimodal request
+stores and looks itself up by its prompt text with every image marker masked to `\036`
+(`visible_prompt_key`, the normalization the live tiers already used); masking preserves
+byte offsets, so the loader's suffix offset stays valid in raw space. (b)
+`ds4_kvstore_build_prompt_with_vision_suffix` rebuilds the prompt from the payload's exact
+tokens plus the suffix text with each image after the frontier spliced from the request's
+own placeholder rows — the disk analogue of `build_live_prompt_suffix` — and the spliced
+positions are written back into the request's spans. A marker run that is not the mask, or
+a block that would read past the request's prompt, is a **refused load and never an
+unlink**: the degradation is a slow turn, not a broken one. Only the completed-prompt
+frontier is written, as a `near-tail` checkpoint; the `continued` ladder stays closed to
+vision, because its key can never match a marker and it is what caused the write storm.
+
+**Field result (2026-11-14 22:00, owner's run, store cleared first).**
+`21:55:23 kv cache stored tokens=307893 reason=near-tail … size=10136.63 MiB save=4702.0 ms`
+→ escape → `22:00:56 live kv cache miss … prompt=307893 common=307893 vision=match` →
+`22:00:58 kv cache hit text … tokens=307893 load=1731.0 ms` →
+**`chat ctx=307893..307893:0 prompt done 0.000s`** — zero tokens prefilled where the same
+escape had cost 307,893 tokens / 583.140 s. Across the whole 1,126-line run: 0
+`identity miss`, 0 `vision tail refused`, 0 `vision frontier rejected`, 0 `kv cache
+discarded`, 0 prefill failures, 0 500s. Nothing of any of those six kinds has appeared
+since the fix in eight days of use (log now 12.7 MB): the 4 remaining `identity miss` lines
+and the 1 `kv cache discarded` are all from 19:22–19:56 on 2026-11-14, before it.
+
+**The open finding: the supplementary tier starves when the store is full.** Eight days
+later the store is back at 238 G/34 files, dominated by 8–12 GiB checkpoints from 14–19
+Nov, and `kv cache skipped … reason=near-tail because supplementary admission has no room`
+has been logged **43 times**, most recently today, with **no near-tail store since 2026-11-18
+16:55**. `kv_cache_tail_admit()` requires the *whole* store to have free space
+(`required <= budget_bytes - total`) and never evicts, while the main pool's ladder runs the
+store to its 240 GiB budget and evicts for itself (80 `disk-cache-full` events). So a
+supplementary pool on a box that fills its budget is not a pool — it is a lottery, and the
+vision frontier silently stops being written. Three ways out, none built:
+
+- **Admit the near-tail pool against its own share** (`kv_cache_tail_budget`), letting it
+  evict only other near-tail files. Semantically right; it is a change to A4/B8's policy.
+- **Raise `--kv-disk-space-mb`** (today 245760 = 240 GiB) — the volume has 387 GiB free, so
+  480 GiB fits. Operator change, no code, immediate.
+- **Prune stale checkpoints** — `rm` of the 8–12 GiB files older than the current
+  conversations. Owner's call, his disk; the tier rebuilds.
+
+Still owed for 0017: **the appended-screenshot resume.** The 22:00 retry's prompt was
+byte-exact to the frontier (the client dropped the escaped partial), so the tail was empty
+and the splice has never run in the field — it stands unit-proven only.

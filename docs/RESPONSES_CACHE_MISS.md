@@ -439,10 +439,26 @@ later the store is back at 238 G/34 files, dominated by 8–12 GiB checkpoints f
 Nov, and `kv cache skipped … reason=near-tail because supplementary admission has no room`
 has been logged **43 times**, most recently today, with **no near-tail store since 2026-11-18
 16:55**. `kv_cache_tail_admit()` requires the *whole* store to have free space
-(`required <= budget_bytes - total`) and never evicts, while the main pool's ladder runs the
+(`required <= budget_bytes - total`), while the main pool's ladder runs the
 store to its 240 GiB budget and evicts for itself (80 `disk-cache-full` events). So a
 supplementary pool on a box that fills its budget is not a pool — it is a lottery, and the
 vision frontier silently stops being written. Three ways out, none built:
+
+> [!warning] Corrected and re-measured 2026-11-24
+> Two fixes to the paragraph above, both mine. **(1) "and never evicts" is wrong.** The
+> near-tail pool has its own share (`kv_cache_tail_budget` = `min(budget/8, 16 GiB ×
+> resident_sessions)`) and it does evict, near-tail files only (`kv_cache_tail_prune`,
+> `evicted reason=near-tail-bound`, 25 lines in this log, latest 2026-11-23 21:43). The real
+> shape is narrower: **admission never consults that share** — it tests the whole store — and
+> the prune runs only *after* a successful store (`ds4_kvstore.c:1376`), so a store already at
+> budget refuses before any prune can help. That makes the first option below much smaller
+> than it reads: change which budget the gate tests, or run the prune on a refusal.
+> **(2) The numbers moved.** On 2026-11-24 the store is nearly empty (1 file, 314 MB; the
+> 238 G/34 files are gone, by eviction or by hand, not established), near-tail writes resumed
+> (7 on 23 Nov, 1 on 24 Nov, latest 02:02:22) and refusals resumed alongside them (10 across
+> 23–24 Nov, latest 02:48:53). The starvation therefore returns within **hours** of heavy
+> vision use, not after eight days — which raises the value of options 1 and 2 and lowers the
+> value of "clear the store once".
 
 - **Admit the near-tail pool against its own share** (`kv_cache_tail_budget`), letting it
   evict only other near-tail files. Semantically right; it is a change to A4/B8's policy.

@@ -435,6 +435,7 @@ apply patches/0014-kv-keep-payload-on-cancelled-prefill.patch
 apply patches/0015-vision-embedding-cache-sized-from-flag.patch
 apply patches/0016-kv-vision-identity-infrastructure-tier-stays-closed.patch
 apply patches/0017-kv-vision-marker-normalized-key-and-tail-splice.patch
+apply patches/0018-server-prefill-preempts-decode.patch
 
 # --- 3. Build in the worktree ---
 # CC must be /usr/bin/clang: the default `cc` on this box is a nix LLVM shim

@@ -1,0 +1,189 @@
+diff --git a/ds4_help.c b/ds4_help.c
+index 4d9d04d..aeecd2b 100644
+--- a/ds4_help.c
++++ b/ds4_help.c
+@@ -352,7 +352,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
+     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
+     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
+     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
+-    opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
++    opt(fp, c, "--mixed-prefill-quantum N", "Cap the prefill chunk while generations are active. Default: 0, same chunk as when idle; GLM-5.3 minimum: 1024");
+     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
+     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
+     fputc('\n', fp);
+diff --git a/ds4_server.c b/ds4_server.c
+index 709da18..4adf2e9 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -13290,6 +13290,25 @@ static int server_next_prefill_slot_locked(const server *s) {
+     return -1;
+ }
+ 
++/* model_mu must be held.  Prompt processing pre-empts generation: one step of
++ * the executor is either a prefill chunk or a decode batch, never both, and a
++ * queued prefill owns the executor against every pending decode token.  A
++ * queued token touches no backend state — server_cancel_pending_decode_locked
++ * withdraws it — so it waits here while prompt work runs.  Decode still runs
++ * between two chunks of the same prefill, which bounds how long a generation
++ * can be held. */
++static bool server_decode_step_allowed_locked(const server *s) {
++    return !s->model_busy && server_next_prefill_slot_locked(s) < 0;
++}
++
++/* model_mu must be held.  The other half of the same ruling: a queued decode
++ * token never holds up prompt work.  Only the exclusive executor and the
++ * round-robin turn between prefills do, and an in-flight batch is exactly what
++ * model_busy claims. */
++static bool server_prefill_step_allowed_locked(const server *s, int id) {
++    return !s->model_busy && server_next_prefill_slot_locked(s) == id;
++}
++
+ static bool server_prefill_enter(server *s, server_slot *slot) {
+     if (!s || !slot || slot_job_cancelled(slot)) return false;
+     if (!s->batched_mode) {
+@@ -13304,9 +13323,11 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
+     pthread_mutex_lock(&s->model_mu);
+     slot->prefill_waiting = true;
+     pthread_cond_broadcast(&s->model_cv);
++    /* Never wait for a queued decode token: prefill pre-empts it.  The
++     * in-flight batch is still awaited, because model_busy is its claim on the
++     * executor, and two prefills still take turns with each other. */
+     while (!g_stop_requested && !slot_job_cancelled(slot) &&
+-           (s->model_busy || s->decode_pending > 0 ||
+-            server_next_prefill_slot_locked(s) != slot->id)) {
++           !server_prefill_step_allowed_locked(s, slot->id)) {
+         pthread_cond_wait(&s->model_cv, &s->model_mu);
+     }
+     if (g_stop_requested || slot_job_cancelled(slot)) {
+@@ -13335,8 +13356,14 @@ static void server_prefill_leave(server *s) {
+ 
+ static int server_prefill_quantum_for(const server *s,
+                                       bool generation_active) {
+-    int quantum = generation_active ? s->mixed_prefill_quantum :
+-        s->idle_prefill_quantum > 2048 ? s->idle_prefill_quantum : 2048;
++    /* A generation on another slot no longer shrinks the chunk: prefill holds
++     * the executor to the end of the chunk, so the small chunk that used to
++     * share it with decode only made prompt work slower for both sessions.
++     * A positive --mixed-prefill-quantum is the operator's deliberate trade:
++     * shorter chunks, so a waiting decode step arrives sooner. */
++    int quantum = s->idle_prefill_quantum > 2048 ? s->idle_prefill_quantum : 2048;
++    if (generation_active && s->mixed_prefill_quantum > 0)
++        quantum = s->mixed_prefill_quantum;
+     if (generation_active && quantum < 1024 && s->engine &&
+         ds4_engine_is_glm53(s->engine)) {
+         quantum = 1024;
+@@ -14390,7 +14417,10 @@ static void *decode_worker_main(void *arg) {
+             }
+         }
+ 
+-        while (s->model_busy) {
++        /* Prompt processing pre-empts generation: start no batch while any
++         * slot has prefill queued.  The withdrawn tokens stay pending and
++         * stay cancellable for as long as they wait here. */
++        while (!server_decode_step_allowed_locked(s)) {
+             pthread_cond_wait(&s->model_cv, &s->model_mu);
+         }
+         if (s->model_stopping && s->decode_pending == 0) break;
+@@ -16887,7 +16917,7 @@ static server_config parse_options(int argc, char **argv) {
+         .ctx_size = 32768,
+         .default_tokens = 393216,
+         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+-        .mixed_prefill_quantum = 128,
++        .mixed_prefill_quantum = 0,
+         .vision_cache_mb = (int)SERVER_IMAGE_CACHE_DEFAULT_MB,
+     };
+     c.kv_cache = kv_cache_default_options();
+@@ -16985,7 +17015,7 @@ static server_config parse_options(int argc, char **argv) {
+             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
+             c.mixed_prefill_quantum =
+-                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
++                parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+         } else if (!strcmp(arg, "--kv-disk-dir")) {
+             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
+         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
+@@ -17496,10 +17526,54 @@ static void test_batched_prefill_round_robin(void) {
+     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
+ }
+ 
++/* Prompt processing pre-empts generation, and a queued decode token never
++ * holds up a prefill.  One state, two predicates: the decode worker's gate and
++ * the prefill's, which is how the two can never disagree into a deadlock. */
++static void test_prefill_preempts_decode(void) {
++    server s = {0};
++    server_slot slots[2] = {0};
++    s.slots = slots;
++    s.slot_count = 2;
++    s.last_prefill_slot = 0;
++
++    /* Free executor, no prompt work queued: a decode batch may start. */
++    TEST_ASSERT(server_decode_step_allowed_locked(&s));
++
++    /* A queued decode token does not block prefill: prefill pre-empts it
++     * instead of waiting for it.  slot 1 is the waiting prefill — enter sets
++     * prefill_waiting before it waits on the executor. */
++    slots[1].decode_pending = true;
++    s.decode_pending = 1;
++    slots[1].prefill_waiting = true;
++    TEST_ASSERT(server_prefill_step_allowed_locked(&s, 1));
++    /* The same state is what the decode worker must not run through. */
++    TEST_ASSERT(!server_decode_step_allowed_locked(&s));
++
++    /* Round-robin still orders two prefills against each other: slot 0 ran
++     * last, so slot 1 is next and slot 0 waits. */
++    slots[0].prefill_waiting = true;
++    TEST_ASSERT(server_prefill_step_allowed_locked(&s, 1));
++    TEST_ASSERT(!server_prefill_step_allowed_locked(&s, 0));
++    slots[0].prefill_waiting = false;
++
++    /* A step already running keeps the executor to its end, and the queued
++     * prefill still holds priority over decode when that step finishes. */
++    s.model_busy = true;
++    TEST_ASSERT(!server_decode_step_allowed_locked(&s));
++    TEST_ASSERT(!server_prefill_step_allowed_locked(&s, 1));
++    s.model_busy = false;
++    TEST_ASSERT(!server_decode_step_allowed_locked(&s));
++    TEST_ASSERT(server_prefill_step_allowed_locked(&s, 1));
++
++    /* Only an empty prefill queue lets the decode worker through. */
++    slots[1].prefill_waiting = false;
++    TEST_ASSERT(server_decode_step_allowed_locked(&s));
++}
++
+ static void test_mixed_prefill_quantum_option(void) {
+     char *default_argv[] = {"ds4-server"};
+     server_config defaults = parse_options(1, default_argv);
+-    TEST_ASSERT(defaults.mixed_prefill_quantum == 128);
++    TEST_ASSERT(defaults.mixed_prefill_quantum == 0);
+ 
+     char *custom_argv[] = {
+         "ds4-server", "--mixed-prefill-quantum", "2048"
+@@ -17510,8 +17584,19 @@ static void test_mixed_prefill_quantum_option(void) {
+     server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
+     TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
+     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
++
++    /* Default: a generation elsewhere leaves the chunk wide. */
+     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
+-    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
++    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
++
++    /* The engine's own chunk is used whenever it is wider, and an explicit
++     * cap applies only while a generation is active. */
++    s.idle_prefill_quantum = 8192;
++    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 8192);
++    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 8192);
++    s.mixed_prefill_quantum = 1024;
++    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 8192);
++    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 1024);
+ }
+ 
+ /* Reuse-aware slot routing: the probe must recognize every way a request
+@@ -26099,6 +26184,7 @@ static void ds4_server_unit_tests_run(void) {
+     test_vision_cache_mb_option();
+     test_vision_identity_trailer();
+     test_batched_prefill_round_robin();
++    test_prefill_preempts_decode();
+     test_mixed_prefill_quantum_option();
+     test_multimodal_prefill_resume_frontier();
+     test_batched_live_continuation_slot_binding();

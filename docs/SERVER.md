@@ -86,9 +86,15 @@ fairness, not the aggregate speedup of native batching. Native grouping may
 change floating-point reduction order slightly. V4.1 sessions containing images
 use the ordered fallback.
 
-Long prefills yield to active decoders in bounded intervals, normally 128
-tokens. `--mixed-prefill-quantum N` changes that interval for testing. While
-nothing is decoding, a V4.1 slot prefills in the engine's own chunk.
+Prompt processing pre-empts generation. One step of the executor is either a
+prefill chunk or a decode batch, never both, and a queued prefill wins the
+executor over every pending decode token. A long prefill therefore keeps its
+full chunk while another session generates, and the waiting session gets its
+next token when the chunk ends. `--mixed-prefill-quantum N` caps the chunk while
+generations are active, which trades prompt throughput for a sooner decode step;
+the default `0` keeps the same chunk as when nothing decodes. The chunk is the
+engine's own prefill cap on V4.1 and 2048 tokens elsewhere. Prefills still take
+turns with each other, and decode batches still cover every ready session.
 Session-batched serving uses ordinary target decoding, except Qwen3.8 on
 Metal, where `--mtp` also batches speculative decoding with resident weights
 and uses ordered speculative cycles with SSD expert streaming. Its

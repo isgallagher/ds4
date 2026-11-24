@@ -12,10 +12,10 @@ index 4d9d04d..aeecd2b 100644
      para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
      fputc('\n', fp);
 diff --git a/ds4_server.c b/ds4_server.c
-index 709da18..4adf2e9 100644
+index 709da18..8b1b34a 100644
 --- a/ds4_server.c
 +++ b/ds4_server.c
-@@ -13290,6 +13290,25 @@ static int server_next_prefill_slot_locked(const server *s) {
+@@ -13290,6 +13290,33 @@ static int server_next_prefill_slot_locked(const server *s) {
      return -1;
  }
  
@@ -23,9 +23,17 @@ index 709da18..4adf2e9 100644
 + * the executor is either a prefill chunk or a decode batch, never both, and a
 + * queued prefill owns the executor against every pending decode token.  A
 + * queued token touches no backend state — server_cancel_pending_decode_locked
-+ * withdraws it — so it waits here while prompt work runs.  Decode still runs
-+ * between two chunks of the same prefill, which bounds how long a generation
-+ * can be held. */
++ * withdraws it — so it waits here while prompt work runs.
++ *
++ * Measured 2026-11-24, so nobody re-assumes a bound that is not there: decode
++ * does NOT get a slot between two chunks of the same prefill.  The window
++ * between server_prefill_leave and the next server_prefill_enter is shorter
++ * than the decode worker's wake-up, so the prefill re-queues first and the held
++ * generation waits for the whole prompt: a 23,395-token prefill (34.4 s) froze
++ * the peer's decode 39 s, and a 191,211-token rebuild (279.8 s) froze it 283 s.
++ * Bounding that needs a deliberate yield every N chunks, not a smaller chunk —
++ * a smaller chunk only lowers prefill throughput, because decode still cannot
++ * enter while any prefill is queued. */
 +static bool server_decode_step_allowed_locked(const server *s) {
 +    return !s->model_busy && server_next_prefill_slot_locked(s) < 0;
 +}
@@ -41,7 +49,7 @@ index 709da18..4adf2e9 100644
  static bool server_prefill_enter(server *s, server_slot *slot) {
      if (!s || !slot || slot_job_cancelled(slot)) return false;
      if (!s->batched_mode) {
-@@ -13304,9 +13323,11 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
+@@ -13304,9 +13331,11 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
      pthread_mutex_lock(&s->model_mu);
      slot->prefill_waiting = true;
      pthread_cond_broadcast(&s->model_cv);
@@ -55,7 +63,7 @@ index 709da18..4adf2e9 100644
          pthread_cond_wait(&s->model_cv, &s->model_mu);
      }
      if (g_stop_requested || slot_job_cancelled(slot)) {
-@@ -13335,8 +13356,14 @@ static void server_prefill_leave(server *s) {
+@@ -13335,8 +13364,15 @@ static void server_prefill_leave(server *s) {
  
  static int server_prefill_quantum_for(const server *s,
                                        bool generation_active) {
@@ -64,15 +72,16 @@ index 709da18..4adf2e9 100644
 +    /* A generation on another slot no longer shrinks the chunk: prefill holds
 +     * the executor to the end of the chunk, so the small chunk that used to
 +     * share it with decode only made prompt work slower for both sessions.
-+     * A positive --mixed-prefill-quantum is the operator's deliberate trade:
-+     * shorter chunks, so a waiting decode step arrives sooner. */
++     * A positive --mixed-prefill-quantum is now only a chunk-size knob.  Under
++     * strict priority it does NOT make a waiting decode step arrive sooner —
++     * see server_decode_step_allowed_locked and the 2026-11-24 measurement. */
 +    int quantum = s->idle_prefill_quantum > 2048 ? s->idle_prefill_quantum : 2048;
 +    if (generation_active && s->mixed_prefill_quantum > 0)
 +        quantum = s->mixed_prefill_quantum;
      if (generation_active && quantum < 1024 && s->engine &&
          ds4_engine_is_glm53(s->engine)) {
          quantum = 1024;
-@@ -14390,7 +14417,10 @@ static void *decode_worker_main(void *arg) {
+@@ -14390,7 +14426,10 @@ static void *decode_worker_main(void *arg) {
              }
          }
  
@@ -84,7 +93,7 @@ index 709da18..4adf2e9 100644
              pthread_cond_wait(&s->model_cv, &s->model_mu);
          }
          if (s->model_stopping && s->decode_pending == 0) break;
-@@ -16887,7 +16917,7 @@ static server_config parse_options(int argc, char **argv) {
+@@ -16887,7 +16926,7 @@ static server_config parse_options(int argc, char **argv) {
          .ctx_size = 32768,
          .default_tokens = 393216,
          .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
@@ -93,7 +102,7 @@ index 709da18..4adf2e9 100644
          .vision_cache_mb = (int)SERVER_IMAGE_CACHE_DEFAULT_MB,
      };
      c.kv_cache = kv_cache_default_options();
-@@ -16985,7 +17015,7 @@ static server_config parse_options(int argc, char **argv) {
+@@ -16985,7 +17024,7 @@ static server_config parse_options(int argc, char **argv) {
              c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
          } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
              c.mixed_prefill_quantum =
@@ -102,7 +111,7 @@ index 709da18..4adf2e9 100644
          } else if (!strcmp(arg, "--kv-disk-dir")) {
              c.kv_disk_dir = need_arg(&i, argc, argv, arg);
          } else if (!strcmp(arg, "--kv-disk-space-mb")) {
-@@ -17496,10 +17526,54 @@ static void test_batched_prefill_round_robin(void) {
+@@ -17496,10 +17535,54 @@ static void test_batched_prefill_round_robin(void) {
      TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
  }
  
@@ -158,7 +167,7 @@ index 709da18..4adf2e9 100644
  
      char *custom_argv[] = {
          "ds4-server", "--mixed-prefill-quantum", "2048"
-@@ -17510,8 +17584,19 @@ static void test_mixed_prefill_quantum_option(void) {
+@@ -17510,8 +17593,19 @@ static void test_mixed_prefill_quantum_option(void) {
      server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
      TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
      TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
@@ -179,7 +188,7 @@ index 709da18..4adf2e9 100644
  }
  
  /* Reuse-aware slot routing: the probe must recognize every way a request
-@@ -26099,6 +26184,7 @@ static void ds4_server_unit_tests_run(void) {
+@@ -26099,6 +26193,7 @@ static void ds4_server_unit_tests_run(void) {
      test_vision_cache_mb_option();
      test_vision_identity_trailer();
      test_batched_prefill_round_robin();

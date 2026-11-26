@@ -1,0 +1,218 @@
+diff --git a/ds4_server.c b/ds4_server.c
+index 3864b36..03ff95c 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -10246,6 +10246,14 @@ typedef struct {
+      * the same frontier and image offsets: images precede the answer suffix. */
+     char *visible_reasoning_text;
+     size_t visible_reasoning_len;
++    /* Which of the two renderings above the disk checkpoint must be keyed by.
++     * A new frontier prefers the reasoning rendering, because a client that
++     * receives reasoning summaries replays them inside the assistant turn.
++     * It is set only when a request actually continued from the answer
++     * rendering, so an unproven client keeps the reasoning key.  Mirrors
++     * visible_live_state.token_text_disk_key, which does the same for the
++     * thinking tiers.  Read by kv_cache_visible_checkpoint(). */
++    bool answer_only_disk_key;
+     visible_image_key images;
+     /* Tool-call ids generated at the same live frontier. A following tool
+      * result for these ids is a direct protocol continuation and should not
+@@ -10282,6 +10290,13 @@ struct server_slot {
+     live_tool_state anthropic_live;
+     visible_live_state thinking_live;
+     int continued_last_store_tokens;
++    /* Frontier length of the last prompt checkpoint (reason=near-tail) written
++     * from this slot's own request text.  kv_cache_maybe_store_prompt_tail()
++     * measures the next write against this, never against the reused count: a
++     * thinking turn reuses the hidden reasoning the client does not replay, so
++     * that measure is never behind the prompt and the conversation silently
++     * keeps no checkpoint (design 5.1, REQ-9). */
++    int neartail_last_store_tokens;
+     /* Wall time of the last completed job on this slot, stamped by the slot
+      * worker; drives the staleness tiers in job_slot_score(). */
+     time_t last_used;
+@@ -10782,6 +10797,7 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
+     free(st->visible_reasoning_text);
+     st->visible_reasoning_text = NULL;
+     st->visible_reasoning_len = 0;
++    st->answer_only_disk_key = false;
+     memset(&st->images, 0, sizeof(st->images));
+     st->valid = false;
+     st->live_tokens = 0;
+@@ -11936,9 +11952,16 @@ static void kv_cache_maybe_store_prompt_tail(server *s, server_slot *slot,
+         req->image_count > SERVER_MAX_IMAGES ||
+         !req->prompt_text || !req->prompt_text[0] ||
+         !prompt || prompt->len < s->kv.opt.min_tokens) return;
+-    /* Only frontiers known to belong to this request count as coverage.
+-     * The slot's periodic counter can belong to a different disk-hit branch. */
+-    int covered = cached > cold_saved_tokens ? cached : cold_saved_tokens;
++    /* Only frontiers already proven to belong to this request count as
++     * coverage, and "proven" means written from this slot's own request text
++     * or saved as the cold prefix of this request -- never the reused count.
++     * A thinking turn reuses the hidden reasoning the client does not replay,
++     * so prompt->len - cached is never positive and the conversation keeps no
++     * checkpoint at all (measured 2026-11-25: 100 minutes and 94,936 tokens of
++     * prompt growth with no write and no line). */
++    (void)cached;
++    const int covered = slot->neartail_last_store_tokens > cold_saved_tokens
++                            ? slot->neartail_last_store_tokens : cold_saved_tokens;
+     uint32_t chunk = ds4_engine_prefill_chunk(s->engine);
+     if (!chunk || covered < 0 || prompt->len <= covered ||
+         (uint32_t)(prompt->len - covered) < chunk) return;
+@@ -11957,12 +11980,23 @@ static void kv_cache_maybe_store_prompt_tail(server *s, server_slot *slot,
+         if (!normalized) return;
+         key_text = normalized;
+     }
+-    (void)kv_cache_store_live_prefix_text(s, slot, prompt, prompt->len,
++    const bool stored = kv_cache_store_live_prefix_text(s, slot, prompt, prompt->len,
+                                          "near-tail", key_text,
+                                          KV_EXT_RESPONSES_VISIBLE,
+                                          "responses-prompt",
+                                          req->image_count != 0);
+     free(normalized);
++    if (stored) {
++        slot->neartail_last_store_tokens = prompt->len;
++    } else {
++        /* REQ-9: a conversation left behind its last checkpoint is a failure
++         * the operator has to see.  The store prints its own refusal; this
++         * names the request that lost the checkpoint. */
++        server_log(DS4_LOG_KVCACHE,
++                   "ds4-server: prompt checkpoint not written reason=store-refused "
++                   "prompt=%d covered=%d chunk=%u",
++                   prompt->len, covered, chunk);
++    }
+ }
+ 
+ /* Select the disk key for the slot's current live checkpoint.  Returns the
+@@ -11986,9 +12020,22 @@ static char *kv_cache_visible_checkpoint(server *s, server_slot *slot,
+         slot->responses_live.visible_text &&
+         slot->responses_live.visible_text[0])
+     {
+-        visible_text = xstrdup(slot->responses_live.visible_text);
++        /* Prefer the reasoning rendering until a request proves the client
++         * replays the answer without it.  Both renderings describe the same
++         * frontier and carry the same image offsets, so the extension flag is
++         * unchanged; only the key text and the log label differ. */
++        const char *chosen = slot->responses_live.visible_text;
++        if (!slot->responses_live.answer_only_disk_key &&
++            slot->responses_live.visible_reasoning_text &&
++            slot->responses_live.visible_reasoning_text[0])
++        {
++            chosen = slot->responses_live.visible_reasoning_text;
++            visible_key = "responses-visible-reasoning";
++        } else {
++            visible_key = "responses-visible";
++        }
++        visible_text = xstrdup(chosen);
+         visible_ext = KV_EXT_RESPONSES_VISIBLE;
+-        visible_key = "responses-visible";
+     } else if (slot->thinking_live.valid &&
+                !slot->thinking_live.token_text_disk_key &&
+                slot->thinking_live.live_tokens == tokens->len &&
+@@ -12428,11 +12475,16 @@ typedef struct {
+     int reuse_tokens;   /* live tokens reusable; 0 iff REUSE_NONE */
+     size_t suffix_off;  /* text tiers: byte offset of the new suffix text */
+     int matched_ids;    /* tool-output tiers: number of bound call ids */
++    /* The visible tier has two renderings of the same frontier.  Which one
++     * bound the request decides the key of the next disk checkpoint, so the
++     * execution path can copy it into the live state.  0 = answer rendering,
++     * 1 = reasoning rendering. */
++    int visible_surface;
+ } slot_reuse;
+ 
+ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
+                                           const request *req) {
+-    slot_reuse pr = { REUSE_NONE, 0, 0, 0 };
++    slot_reuse pr = { REUSE_NONE, 0, 0, 0, 0 };
+     if (!s || !slot || !slot->session || !req) return pr;
+     if (!ds4_session_checkpoint_valid(slot->session)) return pr;
+     const ds4_tokens *live = ds4_session_tokens(slot->session);
+@@ -12477,6 +12529,7 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
+                         pr.kind = REUSE_RESPONSES_VISIBLE;
+                         pr.reuse_tokens = live_pos;
+                         pr.suffix_off = lens[i];
++                        pr.visible_surface = (int)i;
+                         free(vkey);
+                         return pr;
+                     }
+@@ -14588,6 +14641,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
+         }
+         live_materialized = true;
+         cache_source = "responses-visible";
++        /* Record which rendering this request replayed, so the checkpoint
++         * written when this slot is evicted or the server stops is keyed by
++         * the same text a later request will send.  Without this the store
++         * always took the answer rendering, and a client that replays
++         * reasoning summaries could never match its own checkpoint. */
++        pthread_mutex_lock(&s->tool_mu);
++        slot->responses_live.answer_only_disk_key = reuse.visible_surface == 0;
++        pthread_mutex_unlock(&s->tool_mu);
+         responses_live_continuation = true;
+         responses_live_match = "visible-prefix";
+         if (responses_live_matches_request(s, slot,
+@@ -22683,6 +22744,57 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
+     pthread_mutex_destroy(&s.tool_mu);
+ }
+ 
++/* The disk checkpoint must be keyed by the rendering the client replays.
++ * A frontier that has both renderings prefers the reasoning rendering, because
++ * a client that receives reasoning summaries replays them inside the assistant
++ * turn; the answer rendering becomes the key only after a request actually
++ * continued from it.  Measured 2026-11-25: the answer rendering as the key cost
++ * 94,974 tokens on a restart, because the next request carried 2,070 bytes of
++ * reasoning the checkpoint did not hold. */
++static void test_visible_checkpoint_keys_disk_by_replayed_rendering(void) {
++    server s = {0};
++    pthread_mutex_init(&s.tool_mu, NULL);
++    const int tokens[] = {1, 2, 3, 4, 5};
++    server_slot slot = {0};
++    slot.session = ds4_session_new_test_checkpoint(tokens, 5);
++    slot.responses_live.valid = true;
++    slot.responses_live.live_tokens = 5;
++    slot.responses_live.visible_text = xstrdup("answer rendering");
++    slot.responses_live.visible_len = strlen("answer rendering");
++    slot.responses_live.visible_reasoning_text = xstrdup("reasoning rendering");
++    slot.responses_live.visible_reasoning_len = strlen("reasoning rendering");
++
++    uint8_t ext = 0;
++    const char *key = NULL;
++    char *picked = kv_cache_visible_checkpoint(&s, &slot, &ext, &key);
++    TEST_ASSERT(picked && strcmp(picked, "reasoning rendering") == 0);
++    TEST_ASSERT(ext == KV_EXT_RESPONSES_VISIBLE);
++    TEST_ASSERT(key && strcmp(key, "responses-visible-reasoning") == 0);
++    free(picked);
++
++    /* A request that continued from the answer rendering proves this client
++     * drops the summary, so the answer rendering is the key from then on. */
++    slot.responses_live.answer_only_disk_key = true;
++    picked = kv_cache_visible_checkpoint(&s, &slot, &ext, &key);
++    TEST_ASSERT(picked && strcmp(picked, "answer rendering") == 0);
++    TEST_ASSERT(key && strcmp(key, "responses-visible") == 0);
++    free(picked);
++
++    /* A turn that emitted no summary has one rendering, and it is the key. */
++    slot.responses_live.answer_only_disk_key = false;
++    free(slot.responses_live.visible_reasoning_text);
++    slot.responses_live.visible_reasoning_text = NULL;
++    slot.responses_live.visible_reasoning_len = 0;
++    picked = kv_cache_visible_checkpoint(&s, &slot, &ext, &key);
++    TEST_ASSERT(picked && strcmp(picked, "answer rendering") == 0);
++    TEST_ASSERT(key && strcmp(key, "responses-visible") == 0);
++    free(picked);
++
++    live_tool_state_free(&slot.responses_live);
++    ds4_session_free_test_checkpoint(slot.session);
++    pthread_mutex_destroy(&s.tool_mu);
++}
++
+ static void test_responses_visible_suffix_matches_client_replay(void) {
+     request r;
+     request_init(&r, REQ_CHAT, 128);
+@@ -26324,6 +26436,7 @@ static void ds4_server_unit_tests_run(void) {
+     test_responses_live_tail_renders_tool_outputs_only();
+     test_responses_tool_output_id_validation();
+     test_responses_stateless_tool_replay_requires_reasoning();
++    test_visible_checkpoint_keys_disk_by_replayed_rendering();
+     test_responses_visible_suffix_matches_client_replay();
+     test_qwen_responses_final_replay_visible_frontier();
+     test_exact_dsml_tool_replay_can_be_disabled();

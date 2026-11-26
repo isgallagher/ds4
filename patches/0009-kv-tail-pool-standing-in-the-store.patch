@@ -1,0 +1,513 @@
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index 0c680a1..c74be0b 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -40,20 +40,10 @@
+ #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
+ #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
+ #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
+-/* Disk-hit counts are evidence that a checkpoint was useful, but only while
+- * the workload still resembles the one that produced those hits. */
+-#define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
+-/* A continued checkpoint that is a strict prefix of the incoming store is a
+- * routine waypoint on the same path. Keep recent hits meaningful, but make
+- * never-hit or stale waypoints cheap victims while pre-evicting for the new
+- * store. */
+-#define KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR 0.05
+-#define KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR 0.45
+-/* Cold/evict/shutdown checkpoints are intentional anchors, not just automatic
+- * waypoints in a single growing conversation. Give them a soft prior so they
+- * survive comparable continued entries, while still allowing pressure and poor
+- * density to evict them. */
+-#define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
++/* Exit order is by last read: see ds4_kvstore_entry_eviction_score().  The
++ * decay floor, the continued-prefix factors and the anchor score factor that
++ * pr1200 introduced are gone, because the field showed they inverted the
++ * intent -- the frontier left first and the never-read anchor stayed. */
+ 
+ typedef struct {
+     char *ptr;
+@@ -508,63 +498,35 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
+     return ok;
+ }
+ 
+-static bool kv_cache_incoming_supersedes_continued(
+-        const ds4_kvstore_entry *e,
+-        const ds4_kvstore_eviction_context *incoming) {
+-    if (!e || !incoming || !incoming->text) return false;
+-    if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
+-    if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
+-    if ((size_t)e->text_bytes >= incoming->text_len) return false;
+-    if (e->model_id != incoming->model_id) return false;
+-    if (incoming->reject_different_quant &&
+-        e->quant_bits != incoming->quant_bits)
+-        return false;
+-    /* A smaller-context checkpoint can be loaded by a larger context, but not
+-     * the reverse.  The incoming checkpoint dominates this one only if it is at
+-     * least as widely reusable. */
+-    if (incoming->ctx_size > e->ctx_size) return false;
+-
+-    char prefix_sha[41];
+-    ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
+-                               prefix_sha);
+-    return !strcmp(prefix_sha, e->sha);
+-}
+-
+-static bool kv_cache_reason_is_anchor(uint8_t reason) {
+-    return reason == DS4_KVSTORE_REASON_COLD ||
+-           reason == DS4_KVSTORE_REASON_EVICT ||
+-           reason == DS4_KVSTORE_REASON_SHUTDOWN;
+-}
+-
++/* Exit order for the store: the checkpoint read back longest ago leaves first,
++ * and at equal last-read time the one read fewer times leaves first.  The
++ * caller evicts the lowest score, so the score is the last-read second, plus
++ * one millisecond per recorded read.  The timestamp dominates and the read
++ * count only breaks ties.
++ *
++ * This replaces three rules that the field showed to be inverted (2026-11-25,
++ * a 240 GiB store with 380 MiB free): a supplementary (near-tail) frontier
++ * scored 0.0 and therefore left before every ordinary checkpoint, while a
++ * never-read anchor scored double and stayed.  That store held 168.8 GiB in
++ * files nothing had ever read, and the frontier that had served three turns in
++ * three minutes was already gone.  Age needs no decay constant, no hit floor
++ * and no size term: an entry earns its place by being read, and the cheapest
++ * way to keep the reads that matter is to drop the ones that never happened.
++ *
++ * An entry never read sorts by its creation time, which is the same statement
++ * in weaker form: it has earned nothing yet.  `live`, `now` and `incoming` stay
++ * in the signature because the callers and the engine's own test pass them. */
+ double ds4_kvstore_entry_eviction_score(
+         const ds4_kvstore_entry *e,
+         const ds4_tokens *live,
+         uint64_t now,
+         const ds4_kvstore_eviction_context *incoming) {
+-    if (!e || e->file_size == 0) return 0.0;
+-    /* Supplementary snapshots must leave before any ordinary checkpoint. */
+-    if (e->reason == DS4_KVSTORE_REASON_NEAR_TAIL) return 0.0;
+     (void)live;
+-    double effective_hits = (double)e->hits;
+-    uint64_t used_at = e->last_used ? e->last_used : e->created_at;
+-    if (used_at == 0) {
+-        effective_hits = 0.0;
+-    } else if (now > used_at) {
+-        double elapsed = (double)(now - used_at);
+-        effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+-        if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
+-    }
+-    double score = (effective_hits + 1.0) *
+-                   (double)e->tokens / (double)e->file_size;
+-    if (kv_cache_reason_is_anchor(e->reason))
+-        score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
+-    if (kv_cache_incoming_supersedes_continued(e, incoming)) {
+-        double h = effective_hits > 0.0 ?
+-            effective_hits / (effective_hits + 1.0) : 0.0;
+-        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
+-                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+-    }
+-    return score;
++    (void)now;
++    (void)incoming;
++    if (!e || e->file_size == 0) return 0.0;
++    const uint64_t used_at = e->last_used ? e->last_used : e->created_at;
++    return (double)used_at + (double)e->hits * 0.001;
+ }
+ 
+ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+@@ -588,8 +550,12 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+                                                  incoming);
+             if (score < victim_score ||
+                 (score == victim_score &&
+-                 kc->entry[i].last_used < kc->entry[victim].last_used))
++                 kc->entry[i].file_size > kc->entry[victim].file_size))
+             {
++                /* Equal standing means equal last-read time and equal reads.
++                 * Among equals, the biggest file leaves first: one unlink buys
++                 * the most room, and the choice stops depending on the order
++                 * readdir happened to return. */
+                 victim = i;
+                 victim_score = score;
+             }
+@@ -949,8 +915,9 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
+ }
+ 
+ /* Supplementary storage: no ordinary entry is removed to
+- * admit a tail. At most two published tails use at most one eighth of budget,
+- * capped at 16 GiB. Existing atomic publication completes before pruning.
++ * admit a tail. Published tails use at most one eighth of budget, capped at
++ * 16 GiB per resident session, and at most two per session. Existing atomic
++ * publication completes before pruning.
+  * A replacement temporarily needs room for both old and new published files. */
+ static bool kv_cache_refresh_checked(ds4_kvstore *kc) {
+     ds4_kvstore_clear(kc);
+@@ -975,8 +942,16 @@ static bool kv_cache_refresh_checked(ds4_kvstore *kc) {
+     return ok;
+ }
+ 
++/* Sessions, not servers: a checkpoint is a frontier for one conversation, so a
++ * box that serves N resident sessions needs room for N of them. Read 0 as 1 so
++ * a store opened without the field keeps the single-session figures exactly. */
++static int kv_cache_session_count(const ds4_kvstore *kc) {
++    return kc->resident_sessions > 0 ? kc->resident_sessions : 1;
++}
++
+ static uint64_t kv_cache_tail_budget(const ds4_kvstore *kc) {
+-    const uint64_t cap = 16ull * 1024ull * 1024ull * 1024ull;
++    const uint64_t per_session = 16ull * 1024ull * 1024ull * 1024ull;
++    const uint64_t cap = per_session * (uint64_t)kv_cache_session_count(kc);
+     const uint64_t share = kc->budget_bytes / 8u;
+     return share < cap ? share : cap;
+ }
+@@ -992,6 +967,29 @@ static bool kv_cache_tail_admit(ds4_kvstore *kc, uint64_t published, uint64_t re
+     return total <= kc->budget_bytes && required <= kc->budget_bytes - total;
+ }
+ 
++/* The frontier is the checkpoint that saves the next turn its whole prefill, so
++ * it does not go unsaved just because the ordinary pool took the last byte
++ * first.  Measured 2026-11-25: with the store 380 MiB from its cap, a
++ * 216k-token conversation resumed from 196,608 every turn and paid 19,284 then
++ * 19,684 then 20,031 tokens (31 to 54 s), while 168.8 GiB of that store had
++ * never been read.  So ask once; if there is no room, run the store's own exit
++ * order for exactly this file and ask again.  That order is by last read, so
++ * what leaves is what nothing reads.
++ *
++ * The pool's own share bounds the damage, not the whole store: `published` is
++ * already capped at kv_cache_tail_budget() above, and kv_cache_tail_prune()
++ * keeps the pool inside that share once the write lands.
++ *
++ * Unlike kv_cache_tail_admit(), this unlinks files.  Call it only where a
++ * supplementary store is about to happen. */
++static bool kv_cache_tail_admit_making_room(ds4_kvstore *kc, uint64_t published,
++                                            uint64_t required) {
++    if (kv_cache_tail_admit(kc, published, required)) return true;
++    if (!kc->budget_bytes || published > kv_cache_tail_budget(kc)) return false;
++    ds4_kvstore_evict(kc, NULL, required, NULL);
++    return kv_cache_tail_admit(kc, published, required);
++}
++
+ static bool kv_cache_tail_prune(ds4_kvstore *kc, const char *keep) {
+     if (!kv_cache_refresh_checked(kc)) return false;
+     uint64_t bytes = 0;
+@@ -1005,7 +1003,8 @@ static bool kv_cache_tail_prune(ds4_kvstore *kc, const char *keep) {
+         count++;
+     }
+     if (!seen_keep) return false;
+-    while (count > 2 || bytes > kv_cache_tail_budget(kc)) {
++    while (count > 2 * kv_cache_session_count(kc) ||
++           bytes > kv_cache_tail_budget(kc)) {
+         int victim = -1;
+         for (int i = 0; i < kc->len; i++) {
+             ds4_kvstore_entry *e = &kc->entry[i];
+@@ -1157,7 +1156,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+         if (!payload_est ||
+             !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_est,
+                                        trailer_est_bytes, &file_est, &required_est) ||
+-            !kv_cache_tail_admit(kc, file_est, required_est)) {
++            !kv_cache_tail_admit_making_room(kc, file_est, required_est)) {
+             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                     "%s: kv cache skipped tokens=%d reason=near-tail because supplementary admission has no room",
+                     kv_log_name(kc), store_tokens.len);
+@@ -1212,7 +1211,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+         .reject_different_quant = kc->reject_different_quant,
+     };
+     if (reason_code == DS4_KVSTORE_REASON_NEAR_TAIL) {
+-        if (!kv_cache_tail_admit(kc, est_file_bytes, est_required_bytes)) {
++        if (!kv_cache_tail_admit_making_room(kc, est_file_bytes, est_required_bytes)) {
+             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                     "%s: kv cache skipped tokens=%d reason=near-tail because supplementary admission has no room",
+                     kv_log_name(kc), store_tokens.len);
+@@ -1280,7 +1279,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+     /* Trailer hooks may have changed size since the estimate. Recheck
+      * admission before publication, while all prior files remain intact. */
+     if (ok && reason_code == DS4_KVSTORE_REASON_NEAR_TAIL &&
+-        !kv_cache_tail_admit(kc, final_file_bytes, final_required_bytes)) {
++        !kv_cache_tail_admit_making_room(kc, final_file_bytes, final_required_bytes)) {
+         saved_errno = ENOSPC;
+         ok = false;
+     }
+diff --git a/ds4_kvstore.h b/ds4_kvstore.h
+index 15d33a6..d2c0d85 100644
+--- a/ds4_kvstore.h
++++ b/ds4_kvstore.h
+@@ -69,6 +69,11 @@ typedef struct {
+     bool enabled;
+     char *dir;
+     uint64_t budget_bytes;
++    /* Resident sessions the host server keeps.  The supplementary (near-tail)
++     * pool is sized per session, because every session's frontier has to
++     * survive its own turn, not just the server's.  0 is read as 1, so a store
++     * opened without this set behaves exactly as a single-session box. */
++    int resident_sessions;
+     bool reject_different_quant;
+     ds4_kvstore_options opt;
+     int continued_last_store_tokens;
+diff --git a/ds4_server.c b/ds4_server.c
+index ae4fdbd..21836f6 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -16694,6 +16694,10 @@ int main(int argc, char **argv) {
+     if (cfg.kv_disk_dir) {
+         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
++        /* The supplementary checkpoint pool is sized per resident session, so it
++         * needs the slot count the server actually allocated, not a value the
++         * operator has to keep in sync with --batched-session by hand. */
++        s.kv.resident_sessions = slot_count;
+     }
+     if (s.disable_exact_dsml_tool_replay) {
+         server_log(DS4_LOG_DEFAULT,
+@@ -23997,7 +24001,12 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
+     rmdir(dir);
+ }
+ 
+-static void test_kv_cache_eviction_prefers_anchor_reason(void) {
++static void test_kv_cache_eviction_ignores_reason_class(void) {
++    /* Exit order is the last read, not the reason class.  This is the inversion
++     * the field found on 2026-11-25: an anchor nothing ever read, written when
++     * the server stopped, sat protected by a double score while the frontier
++     * that had just served three turns left first.  Here the anchor is the older
++     * read, so the anchor is the one that goes. */
+     char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
+     char *dir = mkdtemp(tmpl);
+     TEST_ASSERT(dir != NULL);
+@@ -24006,7 +24015,7 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
+     const char *anchor_sha = "1111111111111111111111111111111111111111";
+     const char *continued_sha = "2222222222222222222222222222222222222222";
+     uint64_t now = (uint64_t)time(NULL);
+-    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, now, 2048);
++    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, now - 86400, 2048);
+     test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
+ 
+     char anchor_name[44], continued_name[44];
+@@ -24022,8 +24031,8 @@ static void test_kv_cache_eviction_prefers_anchor_reason(void) {
+     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+     kv_cache_evict(&kc, NULL, 0, NULL);
+ 
+-    TEST_ASSERT(access(anchor_path, F_OK) == 0);
+-    TEST_ASSERT(access(continued_path, F_OK) != 0);
++    TEST_ASSERT(access(anchor_path, F_OK) != 0);
++    TEST_ASSERT(access(continued_path, F_OK) == 0);
+ 
+     kv_cache_close(&kc);
+     unlink(anchor_path);
+@@ -24091,7 +24100,12 @@ static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
+     rmdir(dir);
+ }
+ 
+-static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
++static void test_kv_cache_eviction_gives_no_priority_to_superseded_prefix(void) {
++    /* pr1200 retired a continued checkpoint the moment a longer store covered
++     * it.  That rule is gone with the rest of the scoring: a checkpoint's place
++     * is what it was read at, not what it is a prefix of.  Both stubs carry the
++     * same timestamps here, so the tie decides, and the tie frees the bigger
++     * file -- which is the cold one, not the superseded prefix. */
+     char tmpl[] = "/tmp/ds4-kv-prefix-evict-test.XXXXXX";
+     char *dir = mkdtemp(tmpl);
+     TEST_ASSERT(dir != NULL);
+@@ -24130,8 +24144,8 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
+     };
+     kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+ 
+-    TEST_ASSERT(access(continued_path, F_OK) != 0);
+-    TEST_ASSERT(access(cold_path, F_OK) == 0);
++    TEST_ASSERT(access(continued_path, F_OK) == 0);
++    TEST_ASSERT(access(cold_path, F_OK) != 0);
+ 
+     kv_cache_close(&kc);
+     unlink(continued_path);
+@@ -24141,7 +24155,11 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
+     rmdir(dir);
+ }
+ 
+-static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
++static void test_kv_cache_eviction_breaks_a_tie_by_freeing_the_bigger_file(void) {
++    /* This fixture used to pin the ctx_size guard of the prefix rule above.
++     * The guard is gone, and what is left to pin is the tie-break: equal last
++     * read and equal reads means the bigger file leaves, so one unlink buys the
++     * most room.  The cold stub is the bigger of the two. */
+     char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
+     char *dir = mkdtemp(tmpl);
+     TEST_ASSERT(dir != NULL);
+@@ -24191,25 +24209,38 @@ static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
+     rmdir(dir);
+ }
+ 
+-static void test_kv_cache_eviction_score_decays_stale_hits(void) {
+-    /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
+-     * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
+-     * just stored.  The stale hit bonus decays by inactivity, so fresh wins on
+-     * its better baseline even though stale once had more successful hits. */
++static void test_kv_cache_eviction_score_orders_by_last_read(void) {
++    /* Exit order is the last read and nothing else: the checkpoint read back
++     * longest ago is next to go.  A hit count cannot buy survival, which is the
++     * point (2026-11-25: a store 380 MiB from its cap held 168.8 GiB nothing had
++     * ever read, while the frontier that had served three turns in three minutes
++     * was already evicted).  Hits break a tie at one millisecond each. */
+     const uint64_t now = 1000u + 14u * KV_CACHE_HIT_HALF_LIFE_SECONDS;
+     kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
+     kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = now};
+ 
+-    double s_on = kv_entry_eviction_score(&stale, NULL, now, NULL);
+-    double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
+-    TEST_ASSERT(s_on < f_on);
++    TEST_ASSERT(kv_entry_eviction_score(&stale, NULL, now, NULL) <
++                kv_entry_eviction_score(&fresh, NULL, now, NULL));
++
++    /* A store that was never read back sorts on its creation time, and an entry
++     * with no timestamps is the most expendable thing in the store. */
++    kv_entry born = {.tokens = 4096, .hits = 0, .file_size = 4096, .created_at = 500};
++    TEST_ASSERT(kv_entry_eviction_score(&born, NULL, now, NULL) == 500.0);
++    kv_entry unknown = {.tokens = 4096, .hits = 0, .file_size = 4096};
++    TEST_ASSERT(kv_entry_eviction_score(&unknown, NULL, now, NULL) == 0.0);
++
++    /* Same second: the more-read entry stays. */
++    kv_entry quiet = {.tokens = 4096, .hits = 1, .file_size = 4096, .last_used = 700};
++    kv_entry busy  = {.tokens = 4096, .hits = 9, .file_size = 4096, .last_used = 700};
++    TEST_ASSERT(kv_entry_eviction_score(&quiet, NULL, now, NULL) <
++                kv_entry_eviction_score(&busy, NULL, now, NULL));
+ 
+-    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
+-     * regardless of how old another entry's hit history is. */
+-    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
++    /* A zero-size entry is nothing worth keeping. */
++    kv_entry empty = {.tokens = 4096, .hits = 9, .file_size = 0, .last_used = now};
++    TEST_ASSERT(kv_entry_eviction_score(&empty, NULL, now, NULL) == 0.0);
+ }
+ 
+-static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
++static void test_kv_cache_eviction_older_read_leaves_despite_more_hits(void) {
+     char tmpl[] = "/tmp/ds4-kv-stale-hit-evict-test.XXXXXX";
+     char *dir = mkdtemp(tmpl);
+     TEST_ASSERT(dir != NULL);
+@@ -25209,13 +25240,13 @@ static void ds4_server_unit_tests_run(void) {
+     test_kv_cache_lookup_rejects_wrong_model();
+     test_kv_cache_lookup_rejects_stale_payload_abi();
+     test_kv_cache_eviction_values_fresh_snapshots();
+-    test_kv_cache_eviction_prefers_anchor_reason();
++    test_kv_cache_eviction_ignores_reason_class();
+     test_kv_cache_eviction_makes_room_before_store();
+     test_kv_cache_eviction_ignores_oversize_incoming();
+-    test_kv_cache_eviction_prefers_superseded_continued_prefix();
+-    test_kv_cache_eviction_keeps_smaller_context_prefix();
+-    test_kv_cache_eviction_score_decays_stale_hits();
+-    test_kv_cache_eviction_decayed_hits_tie_break_by_age();
++    test_kv_cache_eviction_gives_no_priority_to_superseded_prefix();
++    test_kv_cache_eviction_breaks_a_tie_by_freeing_the_bigger_file();
++    test_kv_cache_eviction_score_orders_by_last_read();
++    test_kv_cache_eviction_older_read_leaves_despite_more_hits();
+     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+ }
+ 
+diff --git a/tests/test_kvstore_near_tail.c b/tests/test_kvstore_near_tail.c
+index 6515ebe..00bf8ec 100644
+--- a/tests/test_kvstore_near_tail.c
++++ b/tests/test_kvstore_near_tail.c
+@@ -228,7 +228,7 @@ static void limits(ds4_kvstore *k){
+     for(int i=0;i<k->len;i++)if(k->entry[i].reason==DS4_KVSTORE_REASON_NEAR_TAIL){
+         c++;
+         n+=k->entry[i].file_size;
+-    }assert(c<=2&&n<=kv_cache_tail_budget(k));
++    }assert(c<=2*kv_cache_session_count(k)&&n<=kv_cache_tail_budget(k));
+ }
+ static unsigned char *file_bytes(const char *path,size_t *n){
+     struct stat st;
+@@ -241,6 +241,20 @@ static unsigned char *file_bytes(const char *path,size_t *n){
+     fclose(f);
+     return p;
+ }
++/* Stamp a stored file's own age into its header, so the exit order is tested
++ * against real files and not against a hand-built index. */
++static void stamp_ages(const char *path,uint64_t created,uint64_t last){
++    FILE *f=fopen(path,"r+b");
++    assert(f);
++    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
++    assert(fread(h,1,sizeof(h),f)==sizeof(h));
++    kv_le_put64(h+24,created);
++    kv_le_put64(h+32,last);
++    assert(!fseek(f,0,SEEK_SET));
++    assert(fwrite(h,1,sizeof(h),f)==sizeof(h));
++    assert(!fclose(f));
++}
++
+ int main(void){
+     strcpy(fixture_dir,"/tmp/ds4-kvstore-tail-XXXXXX");
+     assert(mkdtemp(fixture_dir));
+@@ -381,13 +395,23 @@ int main(void){
+     ds4_kvstore_load_result_free(&result);
+     ds4_tokens_free(&effective);
+     assert(ds4_kvstore_find_text_prefix(&k,"prefix-D",0,4,262144)<0);
+-    /* All ordinary entries retain positive score; tails remain expendable after hits. */
++    /* No reason class is expendable by definition. A frontier checkpoint scores
++     * on when it was last read, exactly like an ordinary one. */
+     kv_cache_refresh(&k);
+     for(int i=0;i<k.len;i++){
+         k.entry[i].hits=UINT32_MAX;
++        k.entry[i].last_used=(uint64_t)time(NULL);
+         double x=ds4_kvstore_entry_eviction_score(&k.entry[i],NULL,(uint64_t)time(NULL),NULL);
+-        assert(k.entry[i].reason==DS4_KVSTORE_REASON_NEAR_TAIL?x==0:x>0);
++        assert(x>0);
+     }
++    /* The frontier is not first out any more: one read now scores above an
++     * ordinary anchor read a day ago. */
++    ds4_kvstore_entry tail={.reason=DS4_KVSTORE_REASON_NEAR_TAIL,.tokens=512,.hits=0,
++        .file_size=1024,.last_used=(uint64_t)time(NULL)};
++    ds4_kvstore_entry old_anchor={.reason=DS4_KVSTORE_REASON_COLD,.tokens=512,.hits=0,
++        .file_size=1024,.created_at=(uint64_t)time(NULL)-86400};
++    assert(ds4_kvstore_entry_eviction_score(&old_anchor,NULL,(uint64_t)time(NULL),NULL)
++        <ds4_kvstore_entry_eviction_score(&tail,NULL,(uint64_t)time(NULL),NULL));
+     k.budget_bytes=1024;
+     stages=stage_calls;
+     assert(!store(&k,&e,&s,"too-large","near-tail"));
+@@ -451,6 +475,31 @@ int main(void){
+         assert(ds4_kvstore_read_header(f,&ent,&size)&&ent.reason==reason);
+         fclose(f);
+     }
++    /* Field shape of 2026-11-25, in miniature: the store is exactly full, where
++     * the old rule refused the frontier outright. It now takes the file nothing
++     * has read, oldest read first, and the frontier lands. */
++    for(int i=0;i<400;i++){
++        kv_cache_refresh(&k);
++        uint64_t filled=0;
++        for(int j=0;j<k.len;j++)filled+=k.entry[j].file_size;
++        if(k.len>0&&filled/8u>=4ull*(filled/(uint64_t)k.len))break;
++        char filler[32];
++        snprintf(filler,sizeof(filler),"filler-%d",i);
++        assert(store(&k,&e,&s,filler,"cold"));
++    }
++    kv_cache_refresh(&k);
++    uint64_t used=0;
++    for(int i=0;i<k.len;i++)used+=k.entry[i].file_size;
++    assert(k.len>0&&used/8u>=4ull*(used/(uint64_t)k.len));
++    stamp_ages(ordinary,time(NULL)-86400,time(NULL)-86400);
++    k.budget_bytes=used;                        /* not one byte free */
++    assert(!kv_cache_tail_admit(&k,1024,1024)); /* the plain rule, unchanged: refused */
++    assert(store(&k,&e,&s,"full-store","near-tail"));
++    assert(access(ordinary,F_OK)!=0);           /* the never-read anchor left instead */
++    char *fresh_tail=key_path(&k,"full-store");
++    assert(!access(fresh_tail,F_OK));
++    free(fresh_tail);
++    k.budget_bytes=1024*1024;
+     free(a);
+     free(b);
+     free(ordinary);
+@@ -460,6 +509,20 @@ int main(void){
+     for(int i=0;i<k.len;i++)assert(!unlink(k.entry[i].path));
+     ds4_kvstore_close(&k);
+     assert(!rmdir(fixture_dir));
++    /* Policy, no filesystem: the supplementary pool scales with resident
++     * sessions, and a box that never sets the field keeps the single-session
++     * figures exactly. At 240 GiB the eighth-of-budget share binds from three
++     * sessions up, which is the point: the share, not the per-session cap,
++     * is what an operator buys with --kv-disk-space-mb. */
++    const uint64_t gib=1024ull*1024ull*1024ull;
++    ds4_kvstore s1={0},s2={0},s3={0},s8={0};
++    s1.budget_bytes=s2.budget_bytes=s3.budget_bytes=s8.budget_bytes=240ull*gib;
++    s2.resident_sessions=2;s3.resident_sessions=3;s8.resident_sessions=8;
++    assert(kv_cache_session_count(&s1)==1);
++    assert(kv_cache_tail_budget(&s1)==16ull*gib);   /* min(240/8,16*1) */
++    assert(kv_cache_tail_budget(&s2)==30ull*gib);   /* min(240/8,16*2) */
++    assert(kv_cache_tail_budget(&s3)==30ull*gib);   /* share binds */
++    assert(kv_cache_tail_budget(&s8)==30ull*gib);
+     puts("KV supplementary checkpoint fixture PASS (mock payload; no model oracle)");
+     return 0;
+ }

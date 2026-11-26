@@ -426,7 +426,7 @@ apply patches/0004-responses-vision-block-continuation.patch
 apply patches/0006-vision-embedding-cache-fingerprint-key.patch
 apply patches/0007-responses-fork-guard-visible-keys.patch
 apply patches/0008-kv-discard-reason-per-decision-site.patch
-apply patches/0009-kv-tail-pool-sizes-with-resident-sessions.patch
+apply patches/0009-kv-tail-pool-standing-in-the-store.patch
 apply patches/0010-kvstore-test-stub-payload-bytes.patch
 apply patches/0011-responses-cancel-remember-visible.patch
 apply patches/0012-kv-fork-next-shorter-candidate.patch

@@ -50,8 +50,9 @@ cd "$(dirname "$0")"
 CTX="${CTX:-393216}"
 YARN="${YARN:-1.5}"
 PORT="${PORT:-8080}"
-MTP_FLAG="${MTP_FLAG:---mtp}"   # MTP_FLAG=--mtp-timing on the first run: prints acceptance counters
-MTP_FLAG="--mtp --mtp-timing"
+KV_GB="${KV_GB:-240}"
+KV_DIR="${KV_DIR:-$HOME/.ds4/kv-cache}"
+MTP_FLAG="${MTP_FLAG:---mtp --mtp-timing}"   # --mtp-timing prints acceptance counters. An empty value falls back to the default, so use MTP_FLAG=--mtp to drop them.
 
 # Guard: above native you must have a real factor, or you silently degrade past 262k.
 if awk -v c="$CTX" -v y="$YARN" 'BEGIN { exit !(c+0 > 262144 && y+0 <= 1.0) }'; then
@@ -60,7 +61,12 @@ if awk -v c="$CTX" -v y="$YARN" 'BEGIN { exit !(c+0 > 262144 && y+0 <= 1.0) }'; 
 fi
 
 export DS4_QWEN4_YARN_FACTOR="$YARN"
-echo "ds4 long-context: ctx=$CTX  YaRN=$YARN  port=$PORT  (vision disabled)"
+echo "ds4 long-context: ctx=$CTX  YaRN=$YARN  kv=${KV_GB}GiB  dir=$KV_DIR  port=$PORT  (vision disabled)"
+if [ "$KV_DIR" = "$HOME/.ds4/kv-cache" ]; then
+  echo "NOTE: $KV_DIR is the dir start-qwen38-262k-vision.sh also uses (no YaRN). Do not run that"
+  echo "      profile against this dir — same header, different rotary frame, silent wrong attention."
+  echo "      Isolation rule and rename procedure: docs/KV_PROFILE_ISOLATION.md §4."
+fi
 
 if awk -v c="$CTX" 'BEGIN { exit !(c+0 < 393216) }'; then
   echo "note: ctx $CTX is below 393216 — max thinking will be silently served as 'high'"
@@ -72,14 +78,14 @@ exec ./ds4-server \
   --ctx "$CTX" \
   --port "$PORT" --host 0.0.0.0 --cors \
   -m "$HOME/repos/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf" \
-  $MTP_FLAG \
+  ${MTP_FLAG:+$MTP_FLAG} \
   --warm-weights \
   --prefill-chunk 8192 \
   --tool-memory-max-ids 32768 \
-  --kv-disk-dir ~/.ds4/kv-cache \
-  --kv-disk-space-mb 122880 \
+  --kv-disk-dir "$KV_DIR" \
+  --kv-disk-space-mb "$((KV_GB * 1024))" \
   --kv-cache-min-tokens 4096 \
-  --kv-cache-cold-max-tokens 393216 \
+  --kv-cache-cold-max-tokens "$CTX" \
   --kv-cache-continued-interval-tokens 32768 \
   --kv-cache-reject-different-quant 
 #  --kv-cache-boundary-trim-tokens 0 \

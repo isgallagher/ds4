@@ -1,0 +1,76 @@
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index 0de7255..5b86811 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -581,6 +581,60 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+     }
+ }
+ 
++/* Strict startup sweep: a checkpoint whose envelope does not carry this build's
++ * format version can never be restored, and while it sits in the directory it
++ * consumes real disk that the store cannot see — every budget and eviction sum
++ * walks the indexed entries, and a header that fails to read keeps a file out of
++ * the index entirely (kv_cache_refresh pushes only on success). Owner ruling
++ * 2026-11-26: delete on ANY mismatch, newer or older, and sweep at startup only.
++ * Startup only is not caution but correctness: a file being written has no valid
++ * header until its write completes, so sweeping during serving would unlink a
++ * live write out from under its own writer. Returns files removed. */
++static int kv_cache_sweep_version(ds4_kvstore *kc, uint64_t *freed) {
++    DIR *d = opendir(kc->dir);
++    if (!d) return 0;
++    int removed = 0, kept = 0, n_short = 0, n_magic = 0, n_version = 0, n_abi = 0;
++    struct dirent *de;
++    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
++    while ((de = readdir(d)) != NULL) {
++        char sha[41];
++        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
++        char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
++        struct stat st;
++        if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) { free(path); continue; }
++        size_t got = 0;
++        FILE *fp = fopen(path, "rb");
++        if (fp) { got = fread(h, 1, sizeof(h), fp); fclose(fp); }
++        const char *why = NULL;
++        if (got < sizeof(h)) { why = "unreadable"; n_short++; }
++        else if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
++                 h[2] != KV_CACHE_MAGIC2) { why = "bad-magic"; n_magic++; }
++        else if (h[3] != (uint8_t)KV_CACHE_VERSION) { why = "version"; n_version++; }
++        else if (h[20] != (uint8_t)KV_CACHE_PAYLOAD_ABI) { why = "payload-abi"; n_abi++; }
++        if (!why) { kept++; free(path); continue; }
++        if (unlink(path) == 0) {
++            removed++;
++            *freed += (uint64_t)st.st_size;
++            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                    "%s: kv cache sweep removed reason=%s file=%s size=%.2f MiB",
++                    kv_log_name(kc), why, path, (double)st.st_size / (1024.0 * 1024.0));
++        } else {
++            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                    "%s: kv cache sweep FAILED to remove reason=%s file=%s: %s",
++                    kv_log_name(kc), why, path, strerror(errno));
++        }
++        free(path);
++    }
++    closedir(d);
++    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++            "%s: kv cache sweep dir=%s version=%u payload_abi=%u removed=%d kept=%d freed=%.2f GiB (unreadable=%d bad-magic=%d version=%d payload-abi=%d)",
++            kv_log_name(kc), kc->dir, (unsigned)KV_CACHE_VERSION,
++            (unsigned)KV_CACHE_PAYLOAD_ABI, removed, kept,
++            (double)*freed / (1024.0 * 1024.0 * 1024.0),
++            n_short, n_magic, n_version, n_abi);
++    return removed;
++}
++
+ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+                       bool reject_different_quant, ds4_kvstore_options opt,
+                       const char *log_name,
+@@ -603,6 +657,10 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
+     kc->reject_different_quant = reject_different_quant;
+     kc->opt = opt;
++    /* Sweep before the first eviction pass, so bytes reclaimed from files this
++     * build can never restore are already off the disk when the budget is applied. */
++    uint64_t sweep_freed = 0;
++    kv_cache_sweep_version(kc, &sweep_freed);
+     ds4_kvstore_evict(kc, NULL, 0, NULL);
+     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+             "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",

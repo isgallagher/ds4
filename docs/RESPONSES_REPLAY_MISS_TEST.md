@@ -123,7 +123,8 @@ Prereq: server up, **one at a time** on this machine, with the probe:
 
 ```sh
 cd ~/repos/ds4
-DS4_CACHE_MISS_DEBUG=1 ./start-qwen38-longctx.sh > /tmp/fc-debug/server.log 2>&1 &
+DS4_CACHE_MISS_DEBUG=1 CTX=393216 YARN=1.5 KV_DIR="$HOME/.ds4/kv-cache-393k" \
+  ./start-qwen38-512k.sh > /tmp/fc-debug/server.log 2>&1 &
 # wait for model load (~2-3 min at 393k); then:
 python3 tests/test_responses_replay_miss.py \
     --log /tmp/fc-debug/server.log --pi /etc/profiles/per-user/ian/bin/pi \

@@ -86,10 +86,19 @@ lives in a shell script is not a guard.
 
 | profile | flags | directory | launcher |
 |---------|-------|-----------|----------|
-| 262k + vision (daily driver today) | ctx 262144, no YaRN | `~/.ds4/kv-cache-262k` | `start-qwen38-262k-vision.sh` |
-| 262k + vision, N resident sessions | ctx 262144, no YaRN, `--batched-session N` | same as above, **deliberately** — identical rope frame, so checkpoints carry over instead of being rebuilt | `start-qwen38-batched-vision.sh` |
-| 393k long-context (max thinking) | ctx 393216, `DS4_QWEN4_YARN_FACTOR=1.5` | `~/.ds4/kv-cache-393k` | `start-qwen38-longctx.sh` |
-| 393k, N resident sessions | ctx 393216, YaRN 1.5, `--batched-session N` | must **never** share a directory with a native-frame profile | `start-qwen38-batched.sh` |
+| 512k + vision (daily driver) | ctx 524288, `DS4_QWEN4_YARN_FACTOR=2.0` | `~/.ds4/kv-cache-512k` | `start-qwen38-512k.sh` |
+| 512k + vision, 2 resident sessions | same, `--batched-session 2` | same as above, **deliberately** — identical rope frame, so checkpoints carry over instead of being rebuilt | `start-qwen38-512k-2s.sh` |
+| 1M + vision | ctx 1048576, `DS4_QWEN4_YARN_FACTOR=4.0` | `~/.ds4/kv-cache-1m` | `start-qwen38-1m.sh` |
+| any other context | its own factor | derived: `~/.ds4/kv-cache-yarn<N>` | `CTX=<n> YARN=<f> ./start-qwen38-512k.sh` |
+
+> [!note] Since patch 0020 the launcher derives the directory from the factor, and the
+> server sweeps the store at startup and deletes any checkpoint whose version, payload
+> ABI or provenance frame (rope table, mscale, native ctx, model, quant, ctx, model-file
+> shape) is not its own. §1–§3 asked for a guard that was not a shell convention; that is
+> what shipped, so the directory split is now about keeping each store **warm** rather
+> than about correctness. The 262k, 393k and batched launchers this table used to name
+> were retired on 2026-11-27; they are in the git log, and `CTX=262144 YARN=1.0` or
+> `CTX=393216 YARN=1.5` reproduces them through the 512k launcher.
 
 > [!warning] The directory names above are the recommendation, not the field state
 > Both the 262k vision profile and the 393k YaRN profile are launched today against the **same** `~/.ds4/kv-cache`, which is exactly the mixing §1–§3 warn about. The batched-vision launcher shares it on purpose (same frame); the YaRN launcher warns on every start and refuses a YaRN factor at native context. The rename below is still the correct fix and is still not done.

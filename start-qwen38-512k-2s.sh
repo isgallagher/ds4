@@ -9,6 +9,18 @@
 #   The one-slot version:  ./start-qwen38-512k.sh
 #   The 1M version:        ./start-qwen38-1m.sh
 #
+# THE WIRED-LIMIT GATE — why this profile refuses instead of warning
+#   It requires iogpu.wired_limit_mb >= 118784 (116 GiB) and refuses to start below
+#   it, printing the command. Two reasons: the two-slot plan is 118.7 GiB, so this
+#   profile has no slack to give away; and the limit does not survive a reboot, so
+#   the day it silently returns to the ~96 GiB macOS default you would find out from
+#   an allocation or Metal residency refusal in the middle of a long prefill. The
+#   check is cheap and runs on every start. Raise the limit with:
+#     sudo sysctl iogpu.wired_limit_mb=118784
+#   Give it margin over the plan with 122880 (120 GiB) if two full conversations
+#   start refusing. Do not push toward 128 GiB: the wired set is memory neither the
+#   compressor nor the file cache can reclaim, and macOS needs its own share.
+#
 # WHY TWO SLOTS FIT EVEN THOUGH THE PLAN SAYS THEY DO NOT
 #   Two slots at 524,288 plan 2 x 16.66 GiB of KV + 15.68 GiB workspace + 69.73 GiB
 #   model = ~119 GiB, against a 116 GiB wired limit (iogpu.wired_limit_mb=118784).
@@ -39,5 +51,15 @@ cd "$(dirname "$0")"
 
 export PROFILE="${PROFILE:-512k-2s}"
 export SESSIONS="${SESSIONS:-2}"
+# Hard gate, same value the 1M profile uses. The two-slot plan is 118.7 GiB against
+# a 116 GiB limit, so this profile runs on the plan being ~14 GiB pessimistic — and
+# a reboot resets iogpu.wired_limit_mb to the macOS default of about 96 GiB, at which
+# point two slots fail partway through a long prefill rather than at launch. The check
+# runs on every start. To raise it:
+#   sudo sysctl iogpu.wired_limit_mb=118784      # the value this box already carries
+#   sudo sysctl iogpu.wired_limit_mb=122880      # 120 GiB, if you want margin over the plan
+#   sysctl -n iogpu.wired_limit_mb               # check it took
+# Override the gate deliberately with WIRED_MIN_MB=0 (warn only).
+export WIRED_MIN_MB="${WIRED_MIN_MB:-118784}"
 
 exec ./start-qwen38-512k.sh "$@"

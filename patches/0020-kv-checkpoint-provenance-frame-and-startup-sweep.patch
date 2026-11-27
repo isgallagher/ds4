@@ -1,0 +1,676 @@
+diff --git a/ds4.c b/ds4.c
+index 7d82145..a3fefc8 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -7088,6 +7088,26 @@ static bool g_qwen4_rope_yarn = false;
+  * _compute_yarn_parameters with beta_fast 32 / beta_slow 1), the model card's
+  * recipe for prompts beyond 262k tokens; it costs some quality on short text,
+  * so it stays off unless asked for. */
++/* The rope frame this process actually computed: the 32 inverse frequencies, the
++ * mscale, the native context and whether YaRN is applied. KV rows are only
++ * meaningful under the frame that produced them, and a checkpoint header has no
++ * room for a factor, so the store keys on a digest of exactly these bytes.
++ * Owner ruling 2026-11-26: the frame belongs in the checkpoint metadata, because
++ * a YaRN-2.0 file and a native file are otherwise byte-identical to any reader. */
++size_t ds4_qwen4_rope_frame_bytes(uint8_t *buf, size_t cap) {
++    const size_t need = sizeof(g_qwen4_rope_freq) + sizeof(float) + sizeof(uint32_t) + 1u;
++    if (!buf || cap < need) return 0;
++    size_t n = 0;
++    memcpy(buf + n, g_qwen4_rope_freq, sizeof(g_qwen4_rope_freq));
++    n += sizeof(g_qwen4_rope_freq);
++    float ms = g_qwen4_rope_mscale;
++    memcpy(buf + n, &ms, sizeof(ms)); n += sizeof(ms);
++    uint32_t nc = g_qwen4_native_ctx;
++    memcpy(buf + n, &nc, sizeof(nc)); n += sizeof(nc);
++    buf[n++] = g_qwen4_rope_yarn ? 1u : 0u;
++    return n;
++}
++
+ static void qwen4_rope_configure(uint32_t native_ctx) {
+     const uint32_t n_rot = DS4_N_ROT, half = n_rot / 2u;
+     const double base = DS4_ROPE_FREQ_BASE;
+diff --git a/ds4.h b/ds4.h
+index d765600..e88722a 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -262,6 +262,10 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
+ int ds4_engine_embd_dim(ds4_engine *e);
+ uint64_t ds4_engine_model_bytes(ds4_engine *e);
+ bool ds4_engine_has_vision(ds4_engine *e);
++/* Rope frame this process computed (see ds4.c). Returns bytes written, 0 if cap
++ * is short. Feed it to the KV store so checkpoints carry their rotary frame. */
++size_t ds4_qwen4_rope_frame_bytes(uint8_t *buf, size_t cap);
++
+ int ds4_engine_vision_encode_file(ds4_engine *e,
+                                   const char *path,
+                                   ds4_vision_embedding *out,
+diff --git a/ds4_help.c b/ds4_help.c
+index aeecd2b..8b4ca87 100644
+--- a/ds4_help.c
++++ b/ds4_help.c
+@@ -377,7 +377,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
+     opt(fp, c, "--kv-cache-continued-interval-tokens N", "Save aligned continued frontiers. 0 disables. Default: 10000");
+     opt(fp, c, "--kv-cache-boundary-trim-tokens N", "Trim tail tokens for cold boundary saves. Default: 32");
+     opt(fp, c, "--kv-cache-boundary-align-tokens N", "Align cold boundary saves to this multiple. Default: 2048");
+-    opt(fp, c, "--kv-cache-reject-different-quant", "Reject checkpoints written with different routed-expert quantization.");
++    opt(fp, c, "--kv-cache-reject-different-quant[=on|off]", "Startup sweep over the checkpoint store: delete any file whose format version, payload ABI, or provenance frame (rope frame, model, routed-expert quantization, context, model-file shape) is not this server's. On by default; =off reports what it would delete and unlinks nothing. The bare form is kept for compatibility and means on.");
+     opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
+     opt(fp, c, "--tool-memory-max-ids N", "Exact tool-call IDs kept in RAM. Default: 100000");
+     fputc('\n', fp);
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index 0de7255..df80ee0 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -25,7 +25,7 @@
+ #define KV_CACHE_MAGIC0 'K'
+ #define KV_CACHE_MAGIC1 'V'
+ #define KV_CACHE_MAGIC2 'C'
+-#define KV_CACHE_VERSION 1u
++#define KV_CACHE_VERSION 2u
+ /* Header byte 20 carries the graph-payload ABI.  It is separate from the outer
+  * file version because the KVC envelope can remain stable while the serialized
+  * ds4_session internals become unsafe to restore across runtime changes. */
+@@ -318,6 +318,19 @@ void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
+     hex20(digest, out);
+ }
+ 
++/* The frame id is the low 24 bits of the digest, because that is all the header
++ * has room for (bytes 21-23).  16.7 million values is far past the number of
++ * distinct profiles one box runs, and the id never has to be unique across
++ * machines -- it only has to disagree when the rows disagree. */
++uint32_t ds4_kvstore_frame_id(const void *bytes, size_t len) {
++    sha1_ctx c;
++    sha1_init(&c);
++    sha1_update(&c, bytes, len);
++    uint8_t digest[20];
++    sha1_final(&c, digest);
++    return (uint32_t)digest[0] | ((uint32_t)digest[1] << 8) | ((uint32_t)digest[2] << 16);
++}
++
+ bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
+     if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
+     for (int i = 0; i < 40; i++) {
+@@ -405,6 +418,15 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
+     kv_le_put64(h + 40, payload_bytes);
+ }
+ 
++/* Header bytes 21-23 carry the 24-bit provenance frame id. Kept as a pair of
++ * helpers so every write path stamps the same value and no call site invents its
++ * own packing. */
++static void kv_header_set_frame(uint8_t *h, uint32_t frame_id) {
++    h[21] = (uint8_t)(frame_id & 0xffu);
++    h[22] = (uint8_t)((frame_id >> 8) & 0xffu);
++    h[23] = (uint8_t)((frame_id >> 16) & 0xffu);
++}
++
+ /* routed-expert quantizations whose checkpoints the store keys on */
+ bool ds4_kvstore_quant_bits_supported(int quant_bits) {
+     return quant_bits == 2 || quant_bits == 4 || quant_bits == 5 ||
+@@ -421,6 +443,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
+     e->quant_bits = h[4];
+     e->reason = h[5] <= DS4_KVSTORE_REASON_NEAR_TAIL ? h[5] :
+                 DS4_KVSTORE_REASON_UNKNOWN;
++    e->frame_id = (uint32_t)h[21] | ((uint32_t)h[22] << 8) | ((uint32_t)h[23] << 16);
+     e->ext_flags = h[6];
+     e->model_id = h[7];
+     e->tokens = ds4_kvstore_le_get32(h + 8);
+@@ -491,6 +514,7 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
+         ds4_kvstore_fill_header(h, e.model_id, e.quant_bits, e.reason, e.ext_flags,
+                                 e.tokens, hits, e.ctx_size,
+                                 e.created_at, now, e.payload_bytes);
++        kv_header_set_frame(h, e.frame_id); /* a touch rewrites the header; keep the frame */
+         ok = fseek(fp, 0, SEEK_SET) == 0 &&
+              fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+     }
+@@ -581,8 +605,77 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+     }
+ }
+ 
++/* Strict startup sweep: a checkpoint whose envelope does not carry this build's
++ * format version, or whose provenance frame is not this server's, can never be
++ * restored here -- and while it sits in the directory it consumes real disk that
++ * the store cannot see, because every budget and eviction sum walks the indexed
++ * entries and a header that fails to read keeps a file out of the index entirely
++ * (kv_cache_refresh pushes only on success).  Owner ruling 2026-11-26: delete on
++ * ANY mismatch, newer or older, and sweep at startup only.  Startup only is not
++ * caution but correctness: a file being written has no valid header until its
++ * write completes, so sweeping during serving would unlink a live write out from
++ * under its own writer.  The frame digest carries the rope frame, the model, the
++ * routed-expert quantization and the context, so one comparison enforces all
++ * four.  Returns files removed. */
++static int kv_cache_sweep_version(ds4_kvstore *kc, uint64_t *freed) {
++    DIR *d = opendir(kc->dir);
++    if (!d) return 0;
++    int removed = 0, kept = 0, would = 0, n_short = 0, n_magic = 0, n_version = 0, n_abi = 0, n_frame = 0;
++    struct dirent *de;
++    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
++    while ((de = readdir(d)) != NULL) {
++        char sha[41];
++        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
++        char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
++        struct stat st;
++        if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) { free(path); continue; }
++        size_t got = 0;
++        FILE *fp = fopen(path, "rb");
++        if (fp) { got = fread(h, 1, sizeof(h), fp); fclose(fp); }
++        const char *why = NULL;
++        if (got < sizeof(h)) { why = "unreadable"; n_short++; }
++        else if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
++                 h[2] != KV_CACHE_MAGIC2) { why = "bad-magic"; n_magic++; }
++        else if (h[3] != (uint8_t)KV_CACHE_VERSION) { why = "version"; n_version++; }
++        else if (h[20] != (uint8_t)KV_CACHE_PAYLOAD_ABI) { why = "payload-abi"; n_abi++; }
++        else if (((uint32_t)h[21] | ((uint32_t)h[22] << 8) | ((uint32_t)h[23] << 16)) !=
++                 (kc->frame_id & 0xffffffu)) { why = "frame"; n_frame++; }
++        if (!why) { kept++; free(path); continue; }
++        if (!kc->sweep_enforce) {
++            would++;
++            *freed += (uint64_t)st.st_size;
++            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                    "%s: kv cache sweep would remove reason=%s file=%s size=%.2f MiB",
++                    kv_log_name(kc), why, path, (double)st.st_size / (1024.0 * 1024.0));
++            free(path); continue;
++        }
++        if (unlink(path) == 0) {
++            removed++;
++            *freed += (uint64_t)st.st_size;
++            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                    "%s: kv cache sweep removed reason=%s file=%s size=%.2f MiB",
++                    kv_log_name(kc), why, path, (double)st.st_size / (1024.0 * 1024.0));
++        } else {
++            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++                    "%s: kv cache sweep FAILED to remove reason=%s file=%s: %s",
++                    kv_log_name(kc), why, path, strerror(errno));
++        }
++        free(path);
++    }
++    closedir(d);
++    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
++            "%s: kv cache sweep dir=%s mode=%s version=%u payload_abi=%u frame=%06x removed=%d would_remove=%d kept=%d freed=%llu bytes (%.2f GiB) (unreadable=%d bad-magic=%d version=%d payload-abi=%d frame=%d)",
++            kv_log_name(kc), kc->dir, kc->sweep_enforce ? "enforce" : "report-only",
++            (unsigned)KV_CACHE_VERSION,
++            (unsigned)KV_CACHE_PAYLOAD_ABI, (unsigned)(kc->frame_id & 0xffffffu), removed, would, kept,
++            (unsigned long long)*freed,
++            (double)*freed / (1024.0 * 1024.0 * 1024.0),
++            n_short, n_magic, n_version, n_abi, n_frame);
++    return removed;
++}
++
+ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+-                      bool reject_different_quant, ds4_kvstore_options opt,
++                      bool sweep_enforce, ds4_kvstore_options opt,
+                       const char *log_name,
+                       void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+                       void *log_ud) {
+@@ -601,15 +694,23 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+     kc->dir = kv_xstrdup(dir);
+     if (budget_mb == 0) budget_mb = DS4_KVSTORE_DEFAULT_MB;
+     kc->budget_bytes = budget_mb * 1024ull * 1024ull;
+-    kc->reject_different_quant = reject_different_quant;
++    kc->sweep_enforce = sweep_enforce;
+     kc->opt = opt;
++    /* Both of these land before the sweep: the sweep is the one that judges the
++     * frame, so it has to run knowing which frame this process speaks. */
++    kc->frame_id = opt.frame_id & 0xffffffu;
++    /* Sweep before the first eviction pass, so bytes reclaimed from files this
++     * build can never restore are already off the disk when the budget is applied. */
++    uint64_t sweep_freed = 0;
++    kv_cache_sweep_version(kc, &sweep_freed);
+     ds4_kvstore_evict(kc, NULL, 0, NULL);
+     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+-            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
++            "%s: KV disk cache %s (budget=%llu MiB, frame=%06x, sweep=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+             kv_log_name(kc),
+             kc->dir,
+             (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
+-            reject_different_quant ? "reject" : "accept",
++            (unsigned)(kc->frame_id & 0xffffffu),
++            sweep_enforce ? "enforce" : "report-only",
+             kc->opt.min_tokens,
+             kc->opt.cold_max_tokens,
+             kc->opt.continued_interval_tokens,
+@@ -911,12 +1012,14 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
+                                          const char sha[41],
+                                          const char *text, size_t text_len,
+                                          int model_id, int quant_bits, int ctx_size) {
++    /* quant_bits is no longer consulted: a file written under a different routed
++     * quantization has a different frame id and the startup sweep already deleted
++     * it, so there is nothing left for a load-time comparison to protect. */
++    (void)quant_bits;
+     if (access(path, F_OK) != 0) return false;
+     ds4_kvstore_entry e = {0};
+     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
+     bool compatible = e.model_id == (uint8_t)model_id &&
+-                      (!kc->reject_different_quant ||
+-                       e.quant_bits == (uint8_t)quant_bits) &&
+                       e.ctx_size <= (uint32_t)ctx_size &&
+                       kv_cache_file_text_matches(path, sha, text, text_len);
+     ds4_kvstore_entry_free(&e);
+@@ -978,6 +1081,7 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
+                                               hooks->extra_ext_flags),
+                                     hdr.tokens, hdr.hits, hdr.ctx_size,
+                                     hdr.created_at, now, hdr.payload_bytes);
++            kv_header_set_frame(h, hdr.frame_id); /* re-stamp: fill_header memsets */
+             ok = fseeko(fp, 0, SEEK_SET) == 0 &&
+                  fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+                  fflush(fp) == 0;
+@@ -1198,7 +1302,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+             ds4_kvstore_entry entry = {0};
+             bool compatible = ds4_kvstore_read_entry_file(path, sha, &entry) &&
+                 entry.model_id == (uint8_t)model_id &&
+-                (!kc->reject_different_quant || entry.quant_bits == (uint8_t)quant_bits) &&
+                 entry.ctx_size <= (uint32_t)ds4_session_ctx(session) &&
+                 kv_cache_file_text_matches(path, sha, text, text_len);
+             ds4_kvstore_entry_free(&entry);
+@@ -1282,7 +1385,6 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+         .model_id = (uint8_t)model_id,
+         .quant_bits = (uint8_t)quant_bits,
+         .ctx_size = (uint32_t)ds4_session_ctx(session),
+-        .reject_different_quant = kc->reject_different_quant,
+     };
+     if (reason_code == DS4_KVSTORE_REASON_NEAR_TAIL) {
+         if (!kv_cache_tail_admit_making_room(kc, est_file_bytes, est_required_bytes)) {
+@@ -1325,6 +1427,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
+                             (uint32_t)store_tokens.len, 0,
+                             (uint32_t)ds4_session_ctx(session),
+                             now, now, payload_bytes);
++    kv_header_set_frame(h, kc->frame_id); /* this server's provenance frame */
+     uint8_t tb[4];
+     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
+     uint64_t trailer_bytes = 0;
+@@ -1469,6 +1572,7 @@ static int kv_text_candidate_cmp(const void *a, const void *b) {
+  * prompt is read once however many checkpoints the directory holds. */
+ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                  int model_id, int quant_bits, int ctx_size) {
++    (void)quant_bits;   /* see kv_cache_existing_compatible: the sweep owns quant */
+     if (!prompt_text) return -1;
+     const size_t prompt_bytes = strlen(prompt_text);
+     kv_cache_refresh(kc);
+@@ -1480,7 +1584,6 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+         if ((int)e->tokens < kc->opt.min_tokens) continue;
+         if (e->model_id != (uint8_t)model_id) continue;
+         if ((uint32_t)ctx_size < e->ctx_size) continue;
+-        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+         cand[n++] = (kv_text_candidate){ e->text_bytes, i };
+     }
+     qsort(cand, (size_t)n, sizeof(cand[0]), kv_text_candidate_cmp);
+diff --git a/ds4_kvstore.h b/ds4_kvstore.h
+index 54a469c..fc55d83 100644
+--- a/ds4_kvstore.h
++++ b/ds4_kvstore.h
+@@ -54,6 +54,10 @@ typedef struct {
+     uint32_t tokens;
+     uint32_t hits;
+     uint32_t ctx_size;
++    /* 24-bit provenance frame id from header bytes 21-23: a digest of the rope
++     * frame this process computed plus the model, quant and context the rows were
++     * produced under. 0 means "written before the frame existed". */
++    uint32_t frame_id;
+     uint8_t ext_flags;
+     uint64_t created_at;
+     uint64_t last_used;
+@@ -68,18 +72,31 @@ typedef struct {
+     int continued_interval_tokens;
+     int boundary_trim_tokens;
+     int boundary_align_tokens;
++    /* This server's 24-bit provenance frame id: a digest of the rotary mapping it
++     * computed, the model and quantization it loaded, and the context those rows
++     * were validated at.  Computed once at startup by the host and stamped into
++     * every checkpoint this process writes.  0 is what a store holds before the
++     * frame existed, and what a test that never sets it writes. */
++    uint32_t frame_id;
+ } ds4_kvstore_options;
+ 
+ typedef struct {
+     bool enabled;
+     char *dir;
+     uint64_t budget_bytes;
++    /* This server's provenance frame id. The startup sweep unlinks any checkpoint
++     * whose stored frame differs, because those rows were produced by a different
++     * rotary mapping or model and can never be restored correctly here. */
++    uint32_t frame_id;
+     /* Resident sessions the host server keeps.  The supplementary (near-tail)
+      * pool is sized per session, because every session's frontier has to
+      * survive its own turn, not just the server's.  0 is read as 1, so a store
+      * opened without this set behaves exactly as a single-session box. */
+     int resident_sessions;
+-    bool reject_different_quant;
++    /* Strict startup sweep on (true) or report-only (false).  The name is the
++     * legacy flag that used to gate a load-time quant comparison; the sweep does
++     * that job now, because a foreign checkpoint does not survive boot. */
++    bool sweep_enforce;
+     ds4_kvstore_options opt;
+     int continued_last_store_tokens;
+     ds4_kvstore_entry *entry;
+@@ -96,7 +113,6 @@ typedef struct {
+     uint8_t model_id;
+     uint8_t quant_bits;
+     uint32_t ctx_size;
+-    bool reject_different_quant;
+ } ds4_kvstore_eviction_context;
+ 
+ /* One image of the incoming request, described the way the loader needs it.
+@@ -165,7 +181,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason);
+ const char *ds4_kvstore_key_kind(uint8_t ext_flags);
+ 
+ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
+-                      bool reject_different_quant, ds4_kvstore_options opt,
++                      bool sweep_enforce, ds4_kvstore_options opt,
+                       const char *log_name,
+                       void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg),
+                       void *log_ud);
+@@ -281,6 +297,11 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
+ bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
+ bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
+ void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
++/* The 24-bit provenance frame id: the store's own SHA-1 over the identity bytes
++ * the host assembles (rope frame, model, quant, context, model-file shape).
++ * Truncated to the three free header bytes.  Digest the derived values, never a
++ * path or an mtime -- moving a model file must not invalidate a store. */
++uint32_t ds4_kvstore_frame_id(const void *bytes, size_t len);
+ char *ds4_kvstore_path_join(const char *dir, const char *name);
+ char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
+ void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
+diff --git a/ds4_server.c b/ds4_server.c
+index 03ff95c..cebf00e 100644
+--- a/ds4_server.c
++++ b/ds4_server.c
+@@ -11523,9 +11523,47 @@ static void kv_cache_log_cb(void *ud, ds4_kvstore_log_type type, const char *msg
+     server_log(stype, "%s", msg);
+ }
+ 
++/* The provenance frame for this server's checkpoints.  KV rows are only
++ * meaningful under the rotary mapping that produced them, and the checkpoint
++ * header has no room for a YaRN factor, so the store carries a digest in those
++ * three free bytes: the inverse-frequency table the engine actually computed
++ * (which already covers the factor, the mscale and the native length), the
++ * model and routed-expert quantization it loaded, the context those rows were
++ * validated at, and the shape of the model file (its size plus the 24-byte GGUF
++ * preamble: version, tensor count, KV count).  Never the path and never the
++ * mtime, because moving a model file must not invalidate a store.  Owner ruling
++ * 2026-11-26, after a launcher bug wrote 83 GiB of native-frame rows into a
++ * directory labelled YaRN and no reader could tell the difference. */
++static uint32_t kv_cache_frame_id(ds4_engine *engine, const char *model_path,
++                                  int ctx_size) {
++    uint8_t rope[160];
++    const size_t rope_bytes = ds4_qwen4_rope_frame_bytes(rope, sizeof(rope));
++    if (!rope_bytes) return 0;
++    uint8_t buf[256];
++    size_t n = 0;
++    memcpy(buf + n, rope, rope_bytes); n += rope_bytes;
++    buf[n++] = (uint8_t)ds4_engine_model_id(engine);
++    buf[n++] = (uint8_t)ds4_engine_routed_quant_bits(engine);
++    const uint32_t ctx = (uint32_t)ctx_size;
++    for (int i = 0; i < 4; i++) buf[n++] = (uint8_t)((ctx >> (8 * i)) & 0xffu);
++    uint64_t size = 0;
++    struct stat st;
++    if (model_path && stat(model_path, &st) == 0) size = (uint64_t)st.st_size;
++    for (int i = 0; i < 8; i++) buf[n++] = (uint8_t)((size >> (8 * i)) & 0xffu);
++    uint8_t gguf[24] = {0};
++    FILE *fp = model_path ? fopen(model_path, "rb") : NULL;
++    if (fp) {
++        if (fread(gguf, 1, sizeof(gguf), fp) != sizeof(gguf))
++            memset(gguf, 0, sizeof(gguf));
++        fclose(fp);
++    }
++    memcpy(buf + n, gguf, sizeof(gguf)); n += sizeof(gguf);
++    return ds4_kvstore_frame_id(buf, n);
++}
++
+ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb,
+-                          bool reject_different_quant, kv_cache_options opt) {
+-    return ds4_kvstore_open(kc, dir, budget_mb, reject_different_quant, opt,
++                          bool sweep_enforce, kv_cache_options opt) {
++    return ds4_kvstore_open(kc, dir, budget_mb, sweep_enforce, opt,
+                             "ds4-server", kv_cache_log_cb, NULL);
+ }
+ 
+@@ -16832,7 +16870,9 @@ typedef struct {
+     const char *kv_disk_dir;
+     uint64_t kv_disk_space_mb;
+     kv_cache_options kv_cache;
+-    bool kv_cache_reject_different_quant;
++    /* The strict startup sweep runs unless this is set, and the legacy flag
++     * --kv-cache-reject-different-quant=off is what sets it. */
++    bool kv_cache_sweep_report_only;
+     bool disable_exact_dsml_tool_replay;
+     int tool_memory_max_ids;
+     bool enable_cors;
+@@ -17101,7 +17141,24 @@ static server_config parse_options(int argc, char **argv) {
+         } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
+             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
+-            c.kv_cache_reject_different_quant = true;
++            /* Legacy name, and every launcher still passes it, so it stays
++             * accepted.  Its old job -- a load-time quant comparison -- is gone:
++             * the startup sweep deletes a foreign checkpoint before any request
++             * can ask about it.  The bare form is the strict sweep, which is
++             * also the default with the flag absent; `=off` is report-only. */
++            c.kv_cache_sweep_report_only = false;
++        } else if (!strncmp(arg, "--kv-cache-reject-different-quant=",
++                            strlen("--kv-cache-reject-different-quant="))) {
++            const char *v = arg + strlen("--kv-cache-reject-different-quant=");
++            if (!strcmp(v, "off") || !strcmp(v, "false") || !strcmp(v, "0")) {
++                c.kv_cache_sweep_report_only = true;
++            } else if (!strcmp(v, "on") || !strcmp(v, "true") || !strcmp(v, "1")) {
++                c.kv_cache_sweep_report_only = false;
++            } else {
++                server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s",
++                           "--kv-cache-reject-different-quant", v);
++                exit(2);
++            }
+         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
+             c.disable_exact_dsml_tool_replay = true;
+         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
+@@ -17399,8 +17456,13 @@ int main(int argc, char **argv) {
+     }
+ 
+     if (cfg.kv_disk_dir) {
++        /* The frame is computed once, here, from the engine that is loaded and
++         * the file it came from, and every checkpoint this process writes
++         * carries it.  The sweep inside the open judges against it. */
++        cfg.kv_cache.frame_id = kv_cache_frame_id(engine, cfg.engine.model_path,
++                                                  cfg.ctx_size);
+         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
++                      !cfg.kv_cache_sweep_report_only, cfg.kv_cache);
+         /* The supplementary checkpoint pool is sized per resident session, so it
+          * needs the slot count the server actually allocated, not a value the
+          * operator has to keep in sync with --batched-session by hand. */
+@@ -25073,7 +25135,6 @@ static void test_kv_cache_eviction_gives_no_priority_to_superseded_prefix(void)
+         .model_id = 0,
+         .quant_bits = 2,
+         .ctx_size = 32768,
+-        .reject_different_quant = false,
+     };
+     kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+ 
+@@ -25127,7 +25188,6 @@ static void test_kv_cache_eviction_breaks_a_tie_by_freeing_the_bigger_file(void)
+         .model_id = 0,
+         .quant_bits = 2,
+         .ctx_size = 65536,
+-        .reject_different_quant = false,
+     };
+     kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+ 
+diff --git a/tests/test_kvstore_near_tail.c b/tests/test_kvstore_near_tail.c
+index 0554b7f..bc41645 100644
+--- a/tests/test_kvstore_near_tail.c
++++ b/tests/test_kvstore_near_tail.c
+@@ -81,6 +81,42 @@ void ds4_tokens_free(ds4_tokens *t){
+     free(t->v);
+     memset(t,0,sizeof(*t));
+ }
++/* A checkpoint-shaped file the sweep can judge with no model: the fixed header
++ * plus a fixed body, written under an envelope the caller chooses.  The name is
++ * already the shape this store owns, so the only work left is the header. */
++static void write_envelope(const char *path, uint32_t version, uint8_t abi,
++                           uint32_t frame, size_t body) {
++    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
++    ds4_kvstore_fill_header(h, 0, 4, DS4_KVSTORE_REASON_NEAR_TAIL, 0, 4096, 0, 32768,
++                            1000, 1000, body);
++    h[3] = (uint8_t)version;
++    h[20] = abi;
++    kv_header_set_frame(h, frame);
++    FILE *fp = fopen(path, "wb");
++    assert(fp);
++    assert(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
++    for (size_t i = 0; i < body; i++) fputc((int)(i & 0xff), fp);
++    assert(!fclose(fp));
++}
++/* The sweep's own reporting is part of the acceptance, so the test reads the
++ * lines the operator would read. */
++static char sweep_log_buf[16384];
++static size_t sweep_log_len;
++static void sweep_log(void *ud, ds4_kvstore_log_type type, const char *msg) {
++    (void)ud;
++    (void)type;
++    size_t n = strlen(msg);
++    if (sweep_log_len + n + 2 < sizeof(sweep_log_buf)) {
++        memcpy(sweep_log_buf + sweep_log_len, msg, n);
++        sweep_log_len += n;
++        sweep_log_buf[sweep_log_len++] = '\n';
++        sweep_log_buf[sweep_log_len] = 0;
++    }
++}
++static void sweep_log_reset(void) {
++    sweep_log_buf[0] = 0;
++    sweep_log_len = 0;
++}
+ void ds4_tokens_copy(ds4_tokens *to,const ds4_tokens *from){
+     to->len=0;
+     for(int i=0;i<from->len;i++)ds4_tokens_push(to,from->v[i]);
+@@ -632,6 +668,134 @@ int main(void){
+         assert(!rmdir(vdir));
+         assert(!rmdir(fixture_dir));
+     }
++/* ---- The startup sweep, in files.
++     * A checkpoint whose envelope this build cannot read, or whose provenance
++     * frame is not this server's, is deleted where it stands.  Two rulings in
++     * one patch (owner, 2026-11-26): strict on the version -- newer as well as
++     * older -- and strict on the frame, which carries the rope table, the model,
++     * the routed quantization and the context.  The reason it is deletion and
++     * not skipping is the budget: kv_cache_refresh keeps a file with a bad
++     * header out of the index, so it spends real disk while counting as zero. */
++    {
++        char sdir[256];
++        strcpy(sdir, "/tmp/ds4-kvstore-sweep-XXXXXX");
++        assert(mkdtemp(sdir));
++        const uint32_t mine = 0x0abcde;
++        const uint64_t pad = 4096;
++        char good[300], stale[300], newer[300], other_frame[300], dead_abi[300], junk[300], alien[300];
++        snprintf(good, sizeof(good), "%s/%040d.kv", sdir, 1);
++        snprintf(stale, sizeof(stale), "%s/%040d.kv", sdir, 2);
++        snprintf(newer, sizeof(newer), "%s/%040d.kv", sdir, 3);
++        snprintf(other_frame, sizeof(other_frame), "%s/%040d.kv", sdir, 4);
++        snprintf(dead_abi, sizeof(dead_abi), "%s/%040d.kv", sdir, 5);
++        snprintf(junk, sizeof(junk), "%s/%040d.kv", sdir, 6);
++        snprintf(alien, sizeof(alien), "%s/not-a-checkpoint.txt", sdir);
++        write_envelope(good, KV_CACHE_VERSION, KV_CACHE_PAYLOAD_ABI, mine, pad);
++        write_envelope(stale, KV_CACHE_VERSION - 1, KV_CACHE_PAYLOAD_ABI, mine, pad);
++        write_envelope(newer, KV_CACHE_VERSION + 1, KV_CACHE_PAYLOAD_ABI, mine, pad);
++        write_envelope(other_frame, KV_CACHE_VERSION, KV_CACHE_PAYLOAD_ABI, mine ^ 0x000001, pad);
++        write_envelope(dead_abi, KV_CACHE_VERSION, (uint8_t)(KV_CACHE_PAYLOAD_ABI ^ 0xff), mine, pad);
++        FILE *jf = fopen(junk, "wb");
++        assert(jf && fwrite("no header here", 1, 14, jf) == 14 && !fclose(jf));
++        FILE *af = fopen(alien, "wb");
++        assert(af && fwrite("mine", 1, 4, af) == 4 && !fclose(af));
++
++        /* Report-only: every verdict is printed and nothing is unlinked.  This
++         * is what --kv-cache-reject-different-quant=off means now. */
++        sweep_log_reset();
++        ds4_kvstore rk = {0};
++        ds4_kvstore_options ropt = ds4_kvstore_default_options();
++        ropt.frame_id = mine;
++        assert(ds4_kvstore_open(&rk, sdir, 1024, false, ropt, "sweep-test", sweep_log, NULL));
++        assert(!access(good, F_OK) && !access(stale, F_OK) && !access(newer, F_OK) &&
++               !access(other_frame, F_OK) && !access(dead_abi, F_OK) && !access(junk, F_OK));
++        assert(strstr(sweep_log_buf, "mode=report-only"));
++        assert(strstr(sweep_log_buf, " removed=0"));
++        assert(strstr(sweep_log_buf, "would_remove=5"));
++        assert(strstr(sweep_log_buf, "reason=version") && strstr(sweep_log_buf, "reason=payload-abi") &&
++               strstr(sweep_log_buf, "reason=frame") && strstr(sweep_log_buf, "reason=unreadable"));
++        assert(strstr(sweep_log_buf, "frame=0abcde"));
++        ds4_kvstore_close(&rk);
++
++        /* Enforce: four envelope failures and one foreign frame go, the matching
++         * checkpoint stays, and the unparseable file is never named ours. */
++        sweep_log_reset();
++        ds4_kvstore sk = {0};
++        assert(ds4_kvstore_open(&sk, sdir, 1024, true, ropt, "sweep-test", sweep_log, NULL));
++        assert(!access(good, F_OK));
++        assert(access(stale, F_OK) != 0 && access(newer, F_OK) != 0);
++        assert(access(other_frame, F_OK) != 0 && access(dead_abi, F_OK) != 0);
++        assert(access(junk, F_OK) != 0);
++        assert(!access(alien, F_OK));            /* not our name pattern, not ours to delete */
++        assert(strstr(sweep_log_buf, "mode=enforce"));
++        assert(strstr(sweep_log_buf, " removed=5"));
++        assert(strstr(sweep_log_buf, "would_remove=0"));
++        assert(strstr(sweep_log_buf, "kept=1"));
++        /* The summary's byte total is exactly what left the disk: five files,
++         * four of them header + body, one of them the 14-byte junk file. */
++        char expect[64];
++        snprintf(expect, sizeof(expect), "freed=%llu bytes",
++                 (unsigned long long)(4ull * (48ull + pad) + 14ull));
++        assert(strstr(sweep_log_buf, expect));
++        ds4_kvstore_close(&sk);
++
++        /* A different frame is a different server: the file that survived the
++         * sweep above is deleted the moment a process that speaks another
++         * rotary frame opens the same directory.  This is the whole point of
++         * the field id -- the 512k launcher bug wrote 83 GiB of native-frame
++         * rows into a YaRN directory and no reader could tell. */
++        sweep_log_reset();
++        ds4_kvstore fk = {0};
++        ds4_kvstore_options fopt = ds4_kvstore_default_options();
++        fopt.frame_id = mine ^ 0x000002;
++        assert(ds4_kvstore_open(&fk, sdir, 1024, true, fopt, "sweep-test", sweep_log, NULL));
++        assert(access(good, F_OK) != 0);
++        assert(strstr(sweep_log_buf, " removed=1") && strstr(sweep_log_buf, "reason=frame"));
++        assert(strstr(sweep_log_buf, "frame=0abcdc"));
++        ds4_kvstore_close(&fk);
++
++        /* What the sweep writes is what the sweep keeps: a store opened by the
++         * same frame stamps its own checkpoints with that frame, so a second
++         * boot of the same profile deletes nothing. */
++        ds4_kvstore kk = {0};
++        ds4_kvstore_options kopt = ds4_kvstore_default_options();
++        kopt.frame_id = mine;
++        assert(ds4_kvstore_open(&kk, sdir, 1024, true, kopt, "sweep-test", sweep_log, NULL));
++        /* The mock session stages every payload into fixture_dir, which the
++         * earlier blocks already removed, so put it back for this one store. */
++        assert(!mkdir(fixture_dir, 0700));
++        ds4_engine ke = { .model_id = 0, .qwen = 1 };
++        ds4_session ks = {0};
++        for (int i = 0; i < 512; i++) ds4_tokens_push(&ks.tokens, i % 26);
++        assert(store(&kk, &ke, &ks, "stamped", "near-tail"));
++        char *spath = key_path(&kk, "stamped");
++        FILE *sfp = fopen(spath, "rb");
++        assert(sfp);
++        uint8_t sh[DS4_KVSTORE_FIXED_HEADER];
++        assert(fread(sh, 1, sizeof(sh), sfp) == sizeof(sh));
++        fclose(sfp);
++        assert(((uint32_t)sh[21] | ((uint32_t)sh[22] << 8) | ((uint32_t)sh[23] << 16)) == mine);
++        assert(sh[3] == (uint8_t)KV_CACHE_VERSION);
++        free(spath);
++        ds4_tokens_free(&ks.tokens);
++        kv_cache_refresh(&kk);
++        for (int i = 0; i < kk.len; i++) assert(!unlink(kk.entry[i].path));
++        ds4_kvstore_close(&kk);
++        assert(!rmdir(fixture_dir));
++        assert(!unlink(alien));
++        DIR *sd = opendir(sdir);
++        assert(sd);
++        struct dirent *sde;
++        while ((sde = readdir(sd))) {
++            if (!strcmp(sde->d_name, ".") || !strcmp(sde->d_name, "..")) continue;
++            char *p = malloc(strlen(sdir) + strlen(sde->d_name) + 2);
++            sprintf(p, "%s/%s", sdir, sde->d_name);
++            assert(!unlink(p));
++            free(p);
++        }
++        closedir(sd);
++        assert(!rmdir(sdir));
++    }
+     /* Policy, no filesystem: the supplementary pool scales with resident
+      * sessions, and a box that never sets the field keeps the single-session
+      * figures exactly. At 240 GiB the eighth-of-budget share binds from three

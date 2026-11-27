@@ -141,10 +141,17 @@ workloads, the controls are `--kv-cache-min-tokens`,
 `--kv-cache-boundary-trim-tokens`, and `--kv-cache-boundary-align-tokens`.
 Check `./ds4-server --help` for their defaults.
 
-Quantization variants may share compatible prefixes. Add
-`--kv-cache-reject-different-quant` for same-quant reuse only.
-Cache files contain prompt text and model state: treat the directory as
-private. It is disposable; stop the server before clearing it.
+Quantization variants used to be handled at load time by
+`--kv-cache-reject-different-quant`. That comparison is gone: every checkpoint now
+carries a 24-bit provenance frame id (the rope frame the server computed, the model,
+the routed-expert quantization, the context, and the model file's size and GGUF
+preamble), and the startup sweep deletes any file whose frame is not this server's
+before the first request. The flag is kept because the launchers pass it, and its
+meaning changed: the sweep is on by default, the bare flag means on, and
+`=off` makes the sweep report-only, printing each file it would delete and unlinking
+nothing. Cache files contain prompt text and model state: treat the directory as
+private. It is disposable; stop the server before clearing it. Expect the first
+start after this build to empty any store written before it.
 
 ## Tool history and debugging
 

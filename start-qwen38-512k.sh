@@ -67,17 +67,25 @@
 #   TWO SLOTS DO NOT FIT HERE: 2 x 16.66 + 15.68 + 69.73 = ~119 GiB > 116 GiB.
 #
 # KV DISK TIER — read this before you call a restart slow
-#   1. This profile writes its OWN rope frame (factor 2.0). A checkpoint header
-#      carries no rope field (docs/KV_PROFILE_ISOLATION.md §1-3), so this dir must
-#      not be shared with the native 262k profiles or the 1.5 profiles. The guard
-#      below refuses the native dir outright.
+#   1. This profile writes its OWN rope frame (factor 2.0). Since patch 0020 the
+#      checkpoint header carries a 24-bit provenance frame id (rope table, mscale,
+#      native ctx, model, quant, ctx, model-file shape) and the server sweeps the
+#      directory at startup, deleting anything that is not its own — so a foreign-
+#      frame file can no longer be loaded even by accident. Read the
+#      "kv cache sweep" line. The guard below still refuses the native dir outright,
+#      because keeping profiles apart also keeps their stores warm.
 #   2. The per-turn near-tail pool is min(budget/8, 16 GiB x sessions)
-#      (ds4_kvstore.c:1026-1031). At SESSIONS=1 the ceiling is 16 GiB and KV_GB
-#      CANNOT raise it — the 16 GiB is a literal in the code. One 524,288-token
-#      checkpoint is ~17.9 GiB (34 KB/token), so the per-turn frontier is over the
-#      ceiling and will be refused: expect the refusal line, not a silent gap.
-#      The cold path still uses the whole budget, so a restart can still load a
-#      full-prompt checkpoint.
+#      (ds4_kvstore.c:1130). At SESSIONS=1 the ceiling is 16 GiB and KV_GB CANNOT
+#      raise it — the 16 GiB is a literal in the code. It is a TOKEN ceiling, not a
+#      context-length block: a checkpoint costs 113.6 MiB + ~33.3 KiB per token, so
+#      16 GiB holds about 500,000 tokens. MEASURED HERE 2026-11-27: a frontier at
+#      355,882 tokens stored fine as 11,699 MiB, and the next frontier evicted it
+#      ("evicted reason=near-tail-bound") because two of them at this size are
+#      22.8 GiB > 16 GiB. So above ~350k tokens the pool keeps ONE frontier, and
+#      past ~500k it refuses new ones. One client is fine; a second conversation
+#      then evicts the first on every turn. The cold and shutdown paths use the
+#      whole budget, so a restart can still load a full-prompt checkpoint (measured:
+#      shutdown store 11,636 MiB at 353,953 tokens, then a 1,637.9 ms load).
 #   3. The mid-prefill ladder is expensive at this size: at the usual 32,768
 #      interval a single cold rebuild writes 4.46M checkpoint tokens ≈ 145 GiB.
 #      The default here is 131,072 (four rungs, ~43 GiB). 0 disables it outright
@@ -186,18 +194,21 @@ echo
 echo 'VERIFY AFTER START:'
 echo '  1. the memory line reads KV ~16.66 GiB and the plan lands near 102 GiB, not above the wired limit'
 echo '  2. no "context ... exceeds the native 262144 tokens" warning (that means YaRN did not take)'
-echo '  3. first long turn: "chat ctx=0..N" prefills at ~800 t/s and decode lands in the 20s-30s t/s band'
-echo '  4. near-tail stores may be REFUSED at this size (16 GiB pool ceiling at SESSIONS=1) — read the'
-echo '     refusal line, then check the cold store landed so a restart can still load'
-echo '  5. speculation: grep -c "mtp timing micro" then look at committed= — committed>1 is the win.'
-echo '     Compare total=..ms against 25.9 ms, the per-token budget at 38.6 t/s. MTP_DRAFT=1 is the'
-echo '     old behaviour and prints no such lines at all. The acceptance line (--mtp-timing) only'
-echo '     prints when the session is freed, i.e. at shutdown with one slot.'
+echo '  3. first turn after a restart: a "kv cache hit text" line then a SHORT prefill (measured'
+echo '     ctx=353953..355882:1929 prompt done 4.631s). Decode with --mtp-draft 2 measured 44-56 t/s'
+echo '     at 320-360k depth; the 20s-30s band was the old single-draft number at shallower depth.'
+echo '  4. sweep line: "removed=0 kept=N" on a restart of this same profile (frame ff8819 here).'
+echo '     Anything removed means the dir or the profile changed — read the reason= on each line.'
+echo '  5. speculation on this path (batched verify) prints NOTHING per step. Its readout is the'
+echo '     acceptance line at shutdown: "Qwen3.8 mtp: N verify cycles, M first drafts accepted'
+echo '     (%)" — measured 87.0% over 13,962 cycles with MTP_DRAFT=2. For per-step drafted=/committed='
+echo '     ms lines you need the OTHER path: SESSIONS=0 MTP_TIMING=1 (no --batched-session).'
+echo '     MTP_DRAFT=1 is the old single-draft behaviour.'
 echo
 echo 'log it (server writes stderr, so tee alone captures nothing): ./start-qwen38-512k.sh >> ~/ds4-512k.log 2>&1'
 echo 'watch memory:   ps -o rss= -p $(pgrep -f ds4-server) | awk '"'"'{printf "RSS %.1f GB\n", $1/1048576}'"'"''
 echo 'watch routing:  grep -E "KV disk cache|kv cache sweep|context buffers|kv cache (hit|stored|evicted|refused)|exceeds the native"'
-echo 'watch mtp:      grep -E "mtp timing|mtp conf|mtp spec miss" ~/ds4-512k.log | tail -20'
+echo 'watch mtp:      grep -E "Qwen3.8 mtp|mtp timing|mtp conf|mtp spec miss" ~/ds4-512k.log | tail -20'
 echo
 echo 'sampling is the client'"'"'s job (the server takes temperature from each request).'
 echo 'model card, thinking mode: temperature 1.0 top_p 0.95 top_k 20 min_p 0 presence_penalty 0 repetition_penalty 1'

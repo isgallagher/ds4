@@ -15,19 +15,30 @@
 #   (ds4_server.c:17415). Measured first-draft acceptance on this box is 85.7%
 #   (68,520 verify cycles, 58,705 accepted), so the second draft is worth trying.
 #   MTP_DRAFT=2 turns on both; set it back to 1 to reproduce the old behaviour.
-#   What to read: with MTP_TIMING=1 the server prints per speculative step
+#   TWO SPECULATION PATHS, and only one of them prints (measured 2026-11-27 00:0x):
+#     --batched-session >= 1  ->  s.batched_mode is true, so the server takes the
+#       qwen4_batch_mtp branch (ds4_server.c:15407) and verifies through
+#       server_eval_tokens. THIS IS THE DEFAULT HERE, and it prints nothing per step.
+#     --batched-session 0     ->  batched_mode false, so the engine's own multi-draft
+#       function runs (ds4_server.c:15386 -> ds4_session_eval_speculative_argmax_impl,
+#       ds4.c:88531), and THAT is where DS4_MTP_TIMING prints its per-step lines.
+#   Measured on this box with MTP_DRAFT=2 on the batched path: 46.96 t/s mean over 7
+#   turns at ctx 322-327k, against 38.6 t/s at 250-257k before the change — at least
+#   +22% while DEEPER, so the gain is understated.
+#   So MTP_TIMING defaults OFF: with batching on it buys nothing and prints nothing.
+#   Turn it on for the A/B run with SESSIONS=0 MTP_TIMING=1, and read
 #     "ds4: mtp timing micro drafted=N committed=M draft=..ms snapshot=..ms
-#      verify=..ms total=..ms"   (ds4.c:89146, also decode2/margin-skip variants)
-#   and committed>1 per cycle is the win. At 38.6 t/s the budget per token is
-#   25.9 ms, so compare total= against that. Extra knobs, no rebuild needed:
+#      verify=..ms total=..ms"   (also decode2/margin-skip variants).
+#   At 47 t/s the budget per token is 21.3 ms, so compare total= against that.
+#   SESSIONS=0 is now accepted by this script and means "do not pass --batched-session".
+#   Extra knobs, no rebuild needed:
 #   DS4_MTP_CONF_LOG (per-step margin), DS4_MTP_SPEC_LOG (first-draft misses),
 #   DS4_MTP_MIN_MARGIN (overrides --mtp-margin, default 3), DS4_MTP_SPEC_DISABLE
-#   (kill switch). NOTE two things: --mtp-timing, the FLAG, only prints its
-#   cumulative acceptance line when the session is freed, which with one slot means
-#   at server shutdown; and MTP_TIMING=1 makes the engine take clocks inside the
-#   speculative path, so re-measure the decode rate with MTP_TIMING=0 before you
-#   believe a delta. A batched verify also reorders floating-point reductions, so
-#   replies need not reproduce token for token with the old single-draft path.
+#   (kill switch). NOTE: --mtp-timing, the FLAG, only prints its cumulative
+#   acceptance line when the session is freed, which with one slot means at server
+#   shutdown — that line is the readout on the default path. A batched verify also
+#   reorders floating-point reductions, so replies need not reproduce token for token
+#   with the old single-draft path.
 #
 # WHY YaRN 2.0 AND NOT 4.0
 #   The model card: "natively supports context lengths of up to 262,144 tokens ...
@@ -84,7 +95,9 @@ KV_DIR="${KV_DIR:-$HOME/.ds4/kv-cache-512k}"
 MODEL="${MODEL:-$HOME/repos/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf}"
 MMPROJ="${MMPROJ-$HOME/repos/ds4/gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf}"
 MTP_DRAFT="${MTP_DRAFT:-2}"
-MTP_TIMING="${MTP_TIMING:-1}"
+# Off by default: the per-step lines only exist on the non-batched speculative path
+# (see the header), so with SESSIONS>=1 this env buys silence.
+MTP_TIMING="${MTP_TIMING:-0}"
 MTP_FLAG="${MTP_FLAG:---mtp --mtp-timing --mtp-draft $MTP_DRAFT}"
 WARM="${WARM---warm-weights}"
 CONTINUED="${CONTINUED:-131072}"
@@ -128,14 +141,25 @@ WIRED=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
 # Built as an array so a path with a space cannot split into two arguments.
 VISION=()
 [ -n "$MMPROJ" ] && VISION=(--vision "$MMPROJ")
+# SESSIONS=0 means "do not pass --batched-session at all", which is what turns
+# s.batched_mode false (ds4_server.c:17356) and moves speculation onto the engine's
+# own multi-draft path — the one that prints the DS4_MTP_TIMING lines. Slot count
+# stays 1 either way.
+BATCH=()
+[ "$SESSIONS" -gt 0 ] && BATCH=(--batched-session "$SESSIONS")
 PLAN=$(awk -v c="$CTX" 'BEGIN { kv = 8.33 * c / 262144.0; ws = 11.68 + (16.0/1048576.0) * (c - 262144.0); printf "%.1f", 69.73 + kv + ws }')
 KVGIB=$(awk -v c="$CTX" 'BEGIN { printf "%.2f", 8.33 * c / 262144.0 }')
 WSGIB=$(awk -v c="$CTX" 'BEGIN { printf "%.2f", 11.68 + (16.0/1048576.0) * (c - 262144.0) }')
 WIREDBG=$(awk -v w="$WIRED" 'BEGIN { printf "%.0f", w / 1024.0 }')
 
-echo "ds4 512k: ctx=$CTX yarn=$YARN sessions=$SESSIONS kv=${KV_GB}GiB dir=$KV_DIR port=$PORT"
+echo "ds4 512k: ctx=$CTX yarn=$YARN sessions=$SESSIONS$([ "$SESSIONS" -gt 0 ] || echo " (no --batched-session: engine speculative path)") kv=${KV_GB}GiB dir=$KV_DIR port=$PORT"
 echo "         model=$(basename "$MODEL") mmproj=$([ -n "$MMPROJ" ] && basename "$MMPROJ" || echo "text only")"
 echo "         mtp='${MTP_FLAG}' warm='${WARM:-none}' continued=$CONTINUED"
+if [ "$SESSIONS" -gt 0 ]; then
+  echo "         speculation path: qwen4_batch_mtp (batched verify) — per-step lines NOT printed"
+else
+  echo "         speculation path: engine multi-draft — DS4_MTP_TIMING=1 prints per-step lines"
+fi
 if [ "$MTP_TIMING" != "0" ]; then
   echo "         DS4_MTP_TIMING=1 — per-step 'ds4: mtp timing micro drafted= committed=' lines"
   echo "         (adds clock reads to the speculative path: use MTP_TIMING=0 for a clean rate)"
@@ -185,7 +209,7 @@ fi
 
 exec ./ds4-server \
   --ctx "$CTX" \
-  --batched-session "$SESSIONS" \
+  ${BATCH[@]+"${BATCH[@]}"} \
   --port "$PORT" --host 0.0.0.0 --cors \
   -m "$MODEL" \
   ${VISION[@]+"${VISION[@]}"} \

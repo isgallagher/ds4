@@ -1,10 +1,33 @@
 #!/bin/bash
 # Qwen3.8-Flash-Next — 512K profile: ONE resident session, YaRN 2.0, vision on.
 #
-#   Default: CTX=524288  YARN=2.0  SESSIONS=1  KV_GB=240
+#   Default: CTX=524288  YARN=2.0  SESSIONS=1  KV_GB=240  MTP_DRAFT=2  MTP_TIMING=1
 #   Try without images:  MMPROJ= ./start-qwen38-512k.sh
 #   Try without speculation: MTP_FLAG= ./start-qwen38-512k.sh
+#   Try the old single-draft speculation: MTP_DRAFT=1 ./start-qwen38-512k.sh
+#   Measure a clean decode rate (no per-step timing work): MTP_TIMING=0 ./start-qwen38-512k.sh
 #   Try without weight warming (more headroom, slower first turn): WARM= ./start-qwen38-512k.sh
+#
+# SPECULATION — why this script now passes --mtp-draft (added 2026-11-26)
+#   The engine flag --mtp-draft N (see ./ds4-server --help runtime) DEFAULTS TO 1,
+#   and with 1 the engine stops after the first draft (ds4.c:88782) and the server's
+#   batched verify path stays off, because qwen4_batch_mtp requires draft > 1
+#   (ds4_server.c:17415). Measured first-draft acceptance on this box is 85.7%
+#   (68,520 verify cycles, 58,705 accepted), so the second draft is worth trying.
+#   MTP_DRAFT=2 turns on both; set it back to 1 to reproduce the old behaviour.
+#   What to read: with MTP_TIMING=1 the server prints per speculative step
+#     "ds4: mtp timing micro drafted=N committed=M draft=..ms snapshot=..ms
+#      verify=..ms total=..ms"   (ds4.c:89146, also decode2/margin-skip variants)
+#   and committed>1 per cycle is the win. At 38.6 t/s the budget per token is
+#   25.9 ms, so compare total= against that. Extra knobs, no rebuild needed:
+#   DS4_MTP_CONF_LOG (per-step margin), DS4_MTP_SPEC_LOG (first-draft misses),
+#   DS4_MTP_MIN_MARGIN (overrides --mtp-margin, default 3), DS4_MTP_SPEC_DISABLE
+#   (kill switch). NOTE two things: --mtp-timing, the FLAG, only prints its
+#   cumulative acceptance line when the session is freed, which with one slot means
+#   at server shutdown; and MTP_TIMING=1 makes the engine take clocks inside the
+#   speculative path, so re-measure the decode rate with MTP_TIMING=0 before you
+#   believe a delta. A batched verify also reorders floating-point reductions, so
+#   replies need not reproduce token for token with the old single-draft path.
 #
 # WHY YaRN 2.0 AND NOT 4.0
 #   The model card: "natively supports context lengths of up to 262,144 tokens ...
@@ -60,7 +83,9 @@ KV_GB="${KV_GB:-240}"
 KV_DIR="${KV_DIR:-$HOME/.ds4/kv-cache-512k}"
 MODEL="${MODEL:-$HOME/repos/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf}"
 MMPROJ="${MMPROJ-$HOME/repos/ds4/gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf}"
-MTP_FLAG="${MTP_FLAG:---mtp --mtp-timing}"
+MTP_DRAFT="${MTP_DRAFT:-2}"
+MTP_TIMING="${MTP_TIMING:-1}"
+MTP_FLAG="${MTP_FLAG:---mtp --mtp-timing --mtp-draft $MTP_DRAFT}"
 WARM="${WARM---warm-weights}"
 CONTINUED="${CONTINUED:-131072}"
 
@@ -95,6 +120,10 @@ fi
 # rope. The backstop below is what makes that impossible to repeat quietly.
 if awk -v y="$YARN" 'BEGIN { exit !(y+0 > 1.0) }'; then export DS4_QWEN4_YARN_FACTOR="$YARN"; fi
 
+# Per-step speculation timing (see the header). It adds clock reads to the speculative
+# path, so the decode rate read with it on is not the clean rate.
+if [ "$MTP_TIMING" != "0" ]; then export DS4_MTP_TIMING=1; fi
+
 WIRED=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
 # Built as an array so a path with a space cannot split into two arguments.
 VISION=()
@@ -107,6 +136,10 @@ WIREDBG=$(awk -v w="$WIRED" 'BEGIN { printf "%.0f", w / 1024.0 }')
 echo "ds4 512k: ctx=$CTX yarn=$YARN sessions=$SESSIONS kv=${KV_GB}GiB dir=$KV_DIR port=$PORT"
 echo "         model=$(basename "$MODEL") mmproj=$([ -n "$MMPROJ" ] && basename "$MMPROJ" || echo "text only")"
 echo "         mtp='${MTP_FLAG}' warm='${WARM:-none}' continued=$CONTINUED"
+if [ "$MTP_TIMING" != "0" ]; then
+  echo "         DS4_MTP_TIMING=1 — per-step 'ds4: mtp timing micro drafted= committed=' lines"
+  echo "         (adds clock reads to the speculative path: use MTP_TIMING=0 for a clean rate)"
+fi
 awk -v kv="$KVGIB" -v ws="$WSGIB" -v p="$PLAN" -v w="$WIREDBG" 'BEGIN {
   printf "         plan %.1f GiB = 69.73 model + %.2f KV + %.2f workspace (extrapolated)\n", p, kv, ws
   printf "         wired limit %s GiB -> headroom %.1f GiB\n", w, w - p }'
@@ -116,9 +149,11 @@ if [ "${WIRED:-0}" -eq 0 ]; then
 fi
 mkdir -p "$KV_DIR"
 if ls "$KV_DIR"/*.kv >/dev/null 2>&1; then
-  echo "         NOTE: checkpoints written before the YaRN export was fixed (2026-11-26) carry the"
-  echo "         NATIVE frame and the header cannot tell them apart. Empty this dir once:"
-  echo "           rm -f $KV_DIR/*.kv"
+  echo "         NOTE: $KV_DIR already holds checkpoints. Since patch 0020 the server sweeps"
+  echo "         them at startup and deletes any file whose version, payload ABI or provenance"
+  echo "         frame (rope table, model, quant, ctx, model-file shape) is not its own, so a"
+  echo "         foreign-frame file can no longer be loaded. Read the 'kv cache sweep' line."
+  echo "         To delete nothing this run: --kv-cache-reject-different-quant=off (report only)."
 fi
 echo
 echo 'VERIFY AFTER START:'
@@ -127,10 +162,15 @@ echo '  2. no "context ... exceeds the native 262144 tokens" warning (that means
 echo '  3. first long turn: "chat ctx=0..N" prefills at ~800 t/s and decode lands in the 20s-30s t/s band'
 echo '  4. near-tail stores may be REFUSED at this size (16 GiB pool ceiling at SESSIONS=1) — read the'
 echo '     refusal line, then check the cold store landed so a restart can still load'
+echo '  5. speculation: grep -c "mtp timing micro" then look at committed= — committed>1 is the win.'
+echo '     Compare total=..ms against 25.9 ms, the per-token budget at 38.6 t/s. MTP_DRAFT=1 is the'
+echo '     old behaviour and prints no such lines at all. The acceptance line (--mtp-timing) only'
+echo '     prints when the session is freed, i.e. at shutdown with one slot.'
 echo
 echo 'log it (server writes stderr, so tee alone captures nothing): ./start-qwen38-512k.sh >> ~/ds4-512k.log 2>&1'
 echo 'watch memory:   ps -o rss= -p $(pgrep -f ds4-server) | awk '"'"'{printf "RSS %.1f GB\n", $1/1048576}'"'"''
-echo 'watch routing:  grep -E "KV disk cache|context buffers|kv cache (hit|stored|evicted|refused)|exceeds the native"'
+echo 'watch routing:  grep -E "KV disk cache|kv cache sweep|context buffers|kv cache (hit|stored|evicted|refused)|exceeds the native"'
+echo 'watch mtp:      grep -E "mtp timing|mtp conf|mtp spec miss" ~/ds4-512k.log | tail -20'
 echo
 echo 'sampling is the client'"'"'s job (the server takes temperature from each request).'
 echo 'model card, thinking mode: temperature 1.0 top_p 0.95 top_k 20 min_p 0 presence_penalty 0 repetition_penalty 1'

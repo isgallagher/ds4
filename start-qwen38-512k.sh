@@ -1,7 +1,10 @@
 #!/bin/bash
 # Qwen3.8-Flash-Next — 512K profile: ONE resident session, YaRN 2.0, vision on.
 #
-#   Default: CTX=524288  YARN=2.0  SESSIONS=1  KV_GB=240  MTP_DRAFT=2  MTP_TIMING=1
+#   Default: CTX=524288  YARN=2.0  SESSIONS=1  KV_GB=240  MTP_DRAFT=2  MTP_TIMING=0
+#   You do NOT need to pass SESSIONS. The default 1 already sends
+#   --batched-session 1, which is the configuration measured at 46.96 t/s on
+#   2026-11-27. A bare ./start-qwen38-512k.sh is the same command.
 #   Try without images:  MMPROJ= ./start-qwen38-512k.sh
 #   Try without speculation: MTP_FLAG= ./start-qwen38-512k.sh
 #   Try the old single-draft speculation: MTP_DRAFT=1 ./start-qwen38-512k.sh

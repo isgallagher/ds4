@@ -88,6 +88,13 @@ fi
 [ -f "$MODEL" ] || { echo "refusing: model not found: $MODEL" >&2; exit 1; }
 [ -z "$MMPROJ" ] || [ -f "$MMPROJ" ] || { echo "refusing: mmproj not found: $MMPROJ (use MMPROJ= for text only)" >&2; exit 1; }
 
+# The factor must reach the engine through the environment, or the engine keeps the
+# native rotary frame and only WARNS: "context ... exceeds the native 262144 tokens"
+# (ds4.c:60279) and carries on. This export was missing when the script was first
+# written on 2026-11-26, the warning fired, and the profile ran 524288 with native
+# rope. The backstop below is what makes that impossible to repeat quietly.
+if awk -v y="$YARN" 'BEGIN { exit !(y+0 > 1.0) }'; then export DS4_QWEN4_YARN_FACTOR="$YARN"; fi
+
 WIRED=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
 # Built as an array so a path with a space cannot split into two arguments.
 VISION=()
@@ -108,6 +115,11 @@ if [ "${WIRED:-0}" -eq 0 ]; then
   echo "           sudo sysctl iogpu.wired_limit_mb=118784"
 fi
 mkdir -p "$KV_DIR"
+if ls "$KV_DIR"/*.kv >/dev/null 2>&1; then
+  echo "         NOTE: checkpoints written before the YaRN export was fixed (2026-11-26) carry the"
+  echo "         NATIVE frame and the header cannot tell them apart. Empty this dir once:"
+  echo "           rm -f $KV_DIR/*.kv"
+fi
 echo
 echo 'VERIFY AFTER START:'
 echo '  1. the memory line reads KV ~16.66 GiB and the plan lands near 102 GiB, not above the wired limit'
@@ -123,6 +135,13 @@ echo
 echo 'sampling is the client'"'"'s job (the server takes temperature from each request).'
 echo 'model card, thinking mode: temperature 1.0 top_p 0.95 top_k 20 min_p 0 presence_penalty 0 repetition_penalty 1'
 echo 'model card, instruct mode: temperature 0.7 top_p 0.80 top_k 20 min_p 0 presence_penalty 1.5 repetition_penalty 1'
+
+# Backstop: never start a YaRN-sized context without the factor in the environment.
+if awk -v c="$CTX" 'BEGIN { exit !(c+0 > 262144) }' && [ -z "${DS4_QWEN4_YARN_FACTOR:-}" ]; then
+  echo "refusing: DS4_QWEN4_YARN_FACTOR is unset — ctx $CTX would run past the native 262144" >&2
+  echo "          with no rotary scaling, which is a silent quality loss, not an error" >&2
+  exit 1
+fi
 
 exec ./ds4-server \
   --ctx "$CTX" \
